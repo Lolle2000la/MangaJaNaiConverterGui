@@ -103,7 +103,7 @@ class AcceleratorDetector:
         """Detect NVIDIA CUDA devices"""
         devices = []
         try:
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and not (hasattr(torch.version, 'hip') and torch.version.hip is not None):
                 for i in range(torch.cuda.device_count()):
                     try:
                         device_props = torch.cuda.get_device_properties(i)
