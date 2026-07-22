@@ -436,6 +436,16 @@ def final_target_resize(
     return image
 
 
+def _vips_from_array(image: np.ndarray) -> pyvips.Image:
+    vips_img = pyvips.Image.new_from_array(image)
+    if vips_img.interpretation == "multiband":
+        if vips_img.bands == 1:
+            vips_img = vips_img.copy(interpretation="b-w")
+        elif vips_img.bands in (3, 4):
+            vips_img = vips_img.copy(interpretation="srgb")
+    return vips_img
+
+
 def save_image_zip(
     image: np.ndarray,
     file_name: str,
@@ -468,7 +478,7 @@ def save_image_zip(
     args = {"Q": int(lossy_compression_quality)}
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
-    buf_img = pyvips.Image.new_from_array(image).write_to_buffer(f".{image_format}", **args)
+    buf_img = _vips_from_array(image).write_to_buffer(f".{image_format}", **args)
     output_buffer = io.BytesIO(buf_img)  # type: ignore
 
     upscaled_image_data = output_buffer.getvalue()
@@ -507,7 +517,7 @@ def save_image(
     args = {"Q": int(lossy_compression_quality)}
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
-    pyvips.Image.new_from_array(image).write_to_file(output_file_path, **args)
+    _vips_from_array(image).write_to_file(output_file_path, **args)
 
 
 def preprocess_worker_archive(
