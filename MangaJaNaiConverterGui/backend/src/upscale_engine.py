@@ -1149,8 +1149,8 @@ class UpscaleEngine:
             pass
         finally:
             try:
-                upscale_queue.put(UPSCALE_SENTINEL, timeout=1)
-            except Exception:
+                self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
+            except Aborted:
                 pass
 
     def _preprocess_worker_folder(
@@ -1372,8 +1372,8 @@ class UpscaleEngine:
             pass
         finally:
             try:
-                upscale_queue.put(UPSCALE_SENTINEL, timeout=1)
-            except Exception:
+                self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
+            except Aborted:
                 pass
 
     def _preprocess_worker_image(
@@ -1508,8 +1508,8 @@ class UpscaleEngine:
             pass
         finally:
             try:
-                upscale_queue.put(UPSCALE_SENTINEL, timeout=1)
-            except Exception:
+                self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
+            except Aborted:
                 pass
 
     # -- job runners -------------------------------------------------------- #
