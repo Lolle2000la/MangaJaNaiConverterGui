@@ -95,6 +95,8 @@ class ProgressReporter(Protocol):
 
     def file_completed(self, kind: str) -> None: ...
 
+    def phase(self, name: str) -> None: ...
+
 
 class _NoopReporter(ProgressReporter):
     def log(self, message: str) -> None:
@@ -104,6 +106,9 @@ class _NoopReporter(ProgressReporter):
         pass
 
     def file_completed(self, kind: str) -> None:
+        pass
+
+    def phase(self, name: str) -> None:
         pass
 
 
@@ -1575,6 +1580,10 @@ class UpscaleEngine:
 
         preprocess_process.join()
         upscale_process.join()
+        # All pages are upscaled and written to the zip; the remaining work is closing the
+        # archive (central directory + flush), which is pure I/O. Report it as a distinct
+        # phase so the driver/UI can show "finalizing" instead of a stuck 100%.
+        exec.reporter.phase("finalizing")
         postprocess_thread.join()
 
         try:

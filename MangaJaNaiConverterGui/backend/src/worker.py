@@ -178,6 +178,23 @@ class _JobReporter(ProgressReporter):
             event["archive_completed"] = archive_completed
         self._emit(event)
 
+    def phase(self, name: str) -> None:
+        """Emit a named phase transition (e.g. 'finalizing') without touching counters."""
+        with self._lock:
+            completed = self._completed
+            archive_total = self._archive_total
+            archive_completed = self._archive_completed
+        event: dict[str, Any] = {
+            "type": "progress",
+            "id": self._id,
+            "completed": completed,
+            "phase": name,
+        }
+        if archive_total is not None:
+            event["archive_total"] = archive_total
+            event["archive_completed"] = archive_completed
+        self._emit(event)
+
 
 class Worker:
     def __init__(self, settings: dict[str, Any], queue_capacity: int, warmup: bool) -> None:

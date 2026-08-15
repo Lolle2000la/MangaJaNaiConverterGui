@@ -158,11 +158,18 @@ The worker began executing this job.
 ```json
 {"type": "progress", "id": "chap-01", "completed": 7}
 {"type": "progress", "id": "chap-01", "completed": 7, "archive_total": 42, "archive_completed": 3}
+{"type": "progress", "id": "chap-01", "completed": 42, "archive_total": 42, "archive_completed": 42, "phase": "finalizing"}
 ```
 
 `completed` counts finished files for the job. When processing an archive,
 `archive_total` is the number of entries in the current archive and
 `archive_completed` the number finished so far.
+
+`phase` is an optional named stage transition. The only value currently emitted is
+`"finalizing"`, sent after every entry has been upscaled and written but before the
+output archive is closed (central directory + flush) — a pure I/O step that produces
+no further `completed` increments. Drivers may use it to distinguish "still upscaling"
+from "finishing the archive".
 
 ### `done`
 
