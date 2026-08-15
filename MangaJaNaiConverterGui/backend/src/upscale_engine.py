@@ -930,8 +930,8 @@ class UpscaleEngine:
             pass
         finally:
             try:
-                postprocess_queue.put(POSTPROCESS_SENTINEL, timeout=5)
-            except Exception:
+                self._put_up(postprocess_queue, POSTPROCESS_SENTINEL, exec.controller)
+            except Aborted:
                 pass
 
     # -- preprocess step ---------------------------------------------------- #
