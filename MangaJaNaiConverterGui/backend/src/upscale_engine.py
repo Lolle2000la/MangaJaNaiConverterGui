@@ -570,7 +570,23 @@ def save_image(
 # --------------------------------------------------------------------------- #
 
 
+def _run_postprocess(
+    controller: ProgressController,
+    worker: Callable,
+    args: tuple,
+    error_sink: list[BaseException],
+) -> None:
+    """Run a postprocess worker, turning a crash into an abort plus a recorded error."""
+    try:
+        worker(*args)
+    except Exception as exc:
+        controller.abort()
+        error_sink.append(exc)
+        raise
+
+
 def _postprocess_worker_zip(
+    controller: ProgressController,
     postprocess_queue: Queue,
     progress_queue: Queue,
     output_zip_path: str,
@@ -583,6 +599,12 @@ def _postprocess_worker_zip(
 ) -> None:
     with ZipFile(output_zip_path, "w", ZIP_DEFLATED) as output_zip:
         while True:
+            if controller.aborted:
+                break
+            try:
+                item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
+            except queue.Empty:
+                continue
             (
                 image,
                 file_name,
@@ -591,7 +613,7 @@ def _postprocess_worker_zip(
                 original_width,
                 original_height,
                 input_name,
-            ) = postprocess_queue.get()
+            ) = item
             if image is None:
                 break
             if is_image:
@@ -620,10 +642,12 @@ def _postprocess_worker_zip(
                     ("result", {"input": input_name, "output": file_name, "status": "copied"})
                 )
             progress_queue.put(("progress", "postprocess_worker_zip_image"))
-        progress_queue.put(("progress", "postprocess_worker_zip_archive"))
+        if not controller.aborted:
+            progress_queue.put(("progress", "postprocess_worker_zip_archive"))
 
 
 def _postprocess_worker_folder(
+    controller: ProgressController,
     postprocess_queue: Queue,
     progress_queue: Queue,
     output_folder_path: str,
@@ -635,6 +659,12 @@ def _postprocess_worker_folder(
     target_height: int,
 ) -> None:
     while True:
+        if controller.aborted:
+            break
+        try:
+            item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
+        except queue.Empty:
+            continue
         (
             image,
             file_name,
@@ -643,7 +673,7 @@ def _postprocess_worker_folder(
             original_width,
             original_height,
             input_name,
-        ) = postprocess_queue.get()
+        ) = item
         if image is None:
             break
         image = postprocess_image(image)
@@ -671,6 +701,7 @@ def _postprocess_worker_folder(
 
 
 def _postprocess_worker_image(
+    controller: ProgressController,
     postprocess_queue: Queue,
     progress_queue: Queue,
     output_file_path: str,
@@ -682,6 +713,12 @@ def _postprocess_worker_image(
     target_height: int,
 ) -> None:
     while True:
+        if controller.aborted:
+            break
+        try:
+            item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
+        except queue.Empty:
+            continue
         (
             image,
             _file_name,
@@ -690,7 +727,7 @@ def _postprocess_worker_image(
             original_width,
             original_height,
             input_name,
-        ) = postprocess_queue.get()
+        ) = item
         if image is None:
             break
 
@@ -915,7 +952,8 @@ class UpscaleEngine:
                     if is_grayscale:
                         image = convert_image_to_grayscale(image)
 
-                postprocess_queue.put(
+                self._put_up(
+                    postprocess_queue,
                     (
                         image,
                         file_name,
@@ -924,7 +962,8 @@ class UpscaleEngine:
                         original_width,
                         original_height,
                         input_name,
-                    )
+                    ),
+                    exec.controller,
                 )
         except Aborted:
             pass
@@ -1562,29 +1601,39 @@ class UpscaleEngine:
         )
         upscale_process.start()
 
+        postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
-            target=_postprocess_worker_zip,
+            target=_run_postprocess,
             args=(
-                postprocess_queue,
-                progress_queue,
-                output_zip_path,
-                image_format,
-                lossy_compression_quality,
-                use_lossless_compression,
-                target_scale,
-                target_width,
-                target_height,
+                exec.controller,
+                _postprocess_worker_zip,
+                (
+                    exec.controller,
+                    postprocess_queue,
+                    progress_queue,
+                    output_zip_path,
+                    image_format,
+                    lossy_compression_quality,
+                    use_lossless_compression,
+                    target_scale,
+                    target_width,
+                    target_height,
+                ),
+                postprocess_error,
             ),
         )
         postprocess_thread.start()
 
         preprocess_process.join()
         upscale_process.join()
-        # All pages are upscaled and written to the zip; the remaining work is closing the
-        # archive (central directory + flush), which is pure I/O. Report it as a distinct
-        # phase so the driver/UI can show "finalizing" instead of a stuck 100%.
-        exec.reporter.phase("finalizing")
+        if not exec.controller.aborted:
+            # All pages are upscaled and written to the zip; the remaining work is closing the
+            # archive (central directory + flush), which is pure I/O. Report it as a distinct
+            # phase so the driver/UI can show "finalizing" instead of a stuck 100%.
+            exec.reporter.phase("finalizing")
         postprocess_thread.join()
+        if postprocess_error:
+            raise postprocess_error[0]
 
         try:
             progress_queue.put(None, timeout=1)
@@ -1640,18 +1689,25 @@ class UpscaleEngine:
         )
         upscale_process.start()
 
+        postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
-            target=_postprocess_worker_image,
+            target=_run_postprocess,
             args=(
-                postprocess_queue,
-                progress_queue,
-                output_image_path,
-                image_format,
-                lossy_compression_quality,
-                use_lossless_compression,
-                target_scale,
-                target_width,
-                target_height,
+                exec.controller,
+                _postprocess_worker_image,
+                (
+                    exec.controller,
+                    postprocess_queue,
+                    progress_queue,
+                    output_image_path,
+                    image_format,
+                    lossy_compression_quality,
+                    use_lossless_compression,
+                    target_scale,
+                    target_width,
+                    target_height,
+                ),
+                postprocess_error,
             ),
         )
         postprocess_thread.start()
@@ -1659,6 +1715,8 @@ class UpscaleEngine:
         preprocess_process.join()
         upscale_process.join()
         postprocess_thread.join()
+        if postprocess_error:
+            raise postprocess_error[0]
 
         try:
             progress_queue.put(None, timeout=1)
@@ -1826,18 +1884,25 @@ class UpscaleEngine:
         )
         upscale_process.start()
 
+        postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
-            target=_postprocess_worker_folder,
+            target=_run_postprocess,
             args=(
-                postprocess_queue,
-                progress_queue,
-                output_folder_path,
-                image_format,
-                lossy_compression_quality,
-                use_lossless_compression,
-                target_scale,
-                target_width,
-                target_height,
+                exec.controller,
+                _postprocess_worker_folder,
+                (
+                    exec.controller,
+                    postprocess_queue,
+                    progress_queue,
+                    output_folder_path,
+                    image_format,
+                    lossy_compression_quality,
+                    use_lossless_compression,
+                    target_scale,
+                    target_width,
+                    target_height,
+                ),
+                postprocess_error,
             ),
         )
         postprocess_thread.start()
@@ -1845,6 +1910,8 @@ class UpscaleEngine:
         preprocess_process.join()
         upscale_process.join()
         postprocess_thread.join()
+        if postprocess_error:
+            raise postprocess_error[0]
 
         try:
             progress_queue.put(None, timeout=1)
