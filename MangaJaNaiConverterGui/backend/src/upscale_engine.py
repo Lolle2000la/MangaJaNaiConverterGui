@@ -214,9 +214,7 @@ def get_tile_size(tile_size_str: str) -> TileSize:
 
 def standard_resize(image: np.ndarray, new_size: tuple[int, int]) -> np.ndarray:
     """Lanczos downscale without color conversion, for pre-upscale downscale."""
-    new_image = image.astype(np.float32) / 255.0
-    new_image = resize(new_image, new_size, ResizeFilter.Lanczos, False)
-    new_image = (new_image * 255).round().astype(np.uint8)
+    new_image = cv2.resize(image, new_size, interpolation=cv2.INTER_LANCZOS4)
 
     _, _, c = get_h_w_c(image)
 
@@ -238,12 +236,8 @@ def dotgain20_resize(image: np.ndarray, new_size: tuple[int, int]) -> np.ndarray
     pil_image = pil_image.filter(ImageFilter.GaussianBlur(radius=blur_size))
     pil_image = ImageCms.applyTransform(pil_image, dotgain20togamma1transform, False)
 
-    new_image = np.array(pil_image)
-    new_image = new_image.astype(np.float32) / 255.0
-    new_image = resize(new_image, new_size, ResizeFilter.CubicCatrom, False)
-    new_image = (new_image * 255).round().astype(np.uint8)
+    pil_image = pil_image.resize(new_size, Image.Resampling.BICUBIC)
 
-    pil_image = Image.fromarray(new_image[:, :, 0], mode="L")
     pil_image = ImageCms.applyTransform(pil_image, gamma1todotgain20transform, False)
     return np.array(pil_image)
 
@@ -605,6 +599,8 @@ def _postprocess_worker_zip(
                 item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
             except queue.Empty:
                 continue
+            if item is POSTPROCESS_SENTINEL:
+                break
             (
                 image,
                 file_name,
@@ -637,10 +633,11 @@ def _postprocess_worker_zip(
                     ("result", {"input": input_name, "output": entry_name, "status": "upscaled"})
                 )
             else:
-                output_zip.writestr(file_name, image)
-                progress_queue.put(
-                    ("result", {"input": input_name, "output": file_name, "status": "copied"})
-                )
+                if image is not None and isinstance(image, (bytes, str)):
+                    output_zip.writestr(file_name, image)
+                    progress_queue.put(
+                        ("result", {"input": input_name, "output": file_name, "status": "copied"})
+                    )
             progress_queue.put(("progress", "postprocess_worker_zip_image"))
         if not controller.aborted:
             progress_queue.put(("progress", "postprocess_worker_zip_archive"))
@@ -665,6 +662,8 @@ def _postprocess_worker_folder(
             item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
         except queue.Empty:
             continue
+        if item is POSTPROCESS_SENTINEL:
+            break
         (
             image,
             file_name,
@@ -719,6 +718,8 @@ def _postprocess_worker_image(
             item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
         except queue.Empty:
             continue
+        if item is POSTPROCESS_SENTINEL:
+            break
         (
             image,
             _file_name,
@@ -930,6 +931,9 @@ class UpscaleEngine:
                 except queue.Empty:
                     continue
 
+                if item is UPSCALE_SENTINEL:
+                    break
+
                 (
                     image,
                     file_name,
@@ -987,32 +991,46 @@ class UpscaleEngine:
         chains: list[dict[str, Any]],
         grayscale_detection_threshold: int,
     ) -> None:
-        if input_archive_path.endswith(ZIP_EXTENSIONS):
-            with ZipFile(input_archive_path, "r") as input_zip:
-                self._preprocess_worker_archive_file(
-                    exec,
-                    upscale_queue,
-                    input_zip,
-                    output_archive_path,
-                    target_scale,
-                    target_width,
-                    target_height,
-                    chains,
-                    grayscale_detection_threshold,
-                )
-        elif input_archive_path.endswith(RAR_EXTENSIONS):
-            with rarfile.RarFile(input_archive_path, "r") as input_rar:
-                self._preprocess_worker_archive_file(
-                    exec,
-                    upscale_queue,
-                    input_rar,
-                    output_archive_path,
-                    target_scale,
-                    target_width,
-                    target_height,
-                    chains,
-                    grayscale_detection_threshold,
-                )
+        try:
+            lower = input_archive_path.lower()
+            if lower.endswith(ZIP_EXTENSIONS):
+                with ZipFile(input_archive_path, "r") as input_zip:
+                    self._preprocess_worker_archive_file(
+                        exec,
+                        upscale_queue,
+                        input_zip,
+                        output_archive_path,
+                        target_scale,
+                        target_width,
+                        target_height,
+                        chains,
+                        grayscale_detection_threshold,
+                    )
+            elif lower.endswith(RAR_EXTENSIONS):
+                with rarfile.RarFile(input_archive_path, "r") as input_rar:
+                    self._preprocess_worker_archive_file(
+                        exec,
+                        upscale_queue,
+                        input_rar,
+                        output_archive_path,
+                        target_scale,
+                        target_width,
+                        target_height,
+                        chains,
+                        grayscale_detection_threshold,
+                    )
+            else:
+                raise ValueError(f"Unsupported archive format: {input_archive_path}")
+        except Aborted:
+            pass
+        except Exception as e:
+            self._log(exec, f"Failed to process archive {input_archive_path}: {e}")
+            exec.result.error = str(e)
+        finally:
+            try:
+                self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
+            except Aborted:
+                pass
 
     def _preprocess_worker_archive_file(
         self,
@@ -1027,140 +1045,167 @@ class UpscaleEngine:
         grayscale_detection_threshold: int,
     ) -> None:
         os.makedirs(os.path.dirname(output_archive_path), exist_ok=True)
-        namelist = input_archive.namelist()
+        try:
+            namelist = [
+                name
+                for name in input_archive.namelist()
+                if not name.endswith(("/", "\\"))
+            ]
+        except Exception as e:
+            self._log(exec, f"could not read archive namelist: {e}")
+            namelist = []
         exec.reporter.archive_total(len(namelist))
         try:
             for filename in namelist:
                 if exec.controller.aborted:
                     break
                 decoded_filename = filename
-                image_data = None
                 try:
-                    decoded_filename = decoded_filename.encode("cp437").decode(
-                        f"cp{self.system_codepage}"
-                    )
+                    if self.system_codepage:
+                        decoded_filename = decoded_filename.encode("cp437").decode(
+                            f"cp{self.system_codepage}"
+                        )
                 except:  # noqa: E722
                     pass
 
+                image_data = None
                 try:
                     with input_archive.open(filename) as file_in_archive:
                         image_data = file_in_archive.read()
+                except Aborted:
+                    raise
+                except Exception as e:
+                    self._log(
+                        exec,
+                        f"could not read file in archive: {decoded_filename}, {e}",
+                    )
+                    exec.result.add(
+                        {
+                            "input": decoded_filename,
+                            "output": decoded_filename,
+                            "status": "error",
+                            "error": str(e),
+                        }
+                    )
+                    exec.reporter.file_completed("postprocess_worker_zip_image")
+                    continue
 
-                        image = _read_image(image_data, filename)
-                        self._log(exec, f"read image {filename}")
-                        chain, is_grayscale, original_width, original_height = (
-                            get_chain_for_image(
-                                image,
-                                target_scale,
-                                target_width,
-                                target_height,
-                                chains,
-                                grayscale_detection_threshold,
-                                log=exec.reporter.log,
-                            )
+                try:
+                    image = _read_image(image_data, filename)
+                    self._log(exec, f"read image {filename}")
+                    chain, is_grayscale, original_width, original_height = (
+                        get_chain_for_image(
+                            image,
+                            target_scale,
+                            target_width,
+                            target_height,
+                            chains,
+                            grayscale_detection_threshold,
+                            log=exec.reporter.log,
                         )
+                    )
 
-                        if is_grayscale:
-                            image = convert_image_to_grayscale(image)
+                    if is_grayscale:
+                        image = convert_image_to_grayscale(image)
 
-                        model = None
-                        tile_size_str = ""
-                        if chain is not None:
-                            resize_width_before_upscale = chain[
-                                "ResizeWidthBeforeUpscale"
-                            ]
-                            resize_height_before_upscale = chain[
-                                "ResizeHeightBeforeUpscale"
-                            ]
-                            resize_factor_before_upscale = chain[
-                                "ResizeFactorBeforeUpscale"
-                            ]
+                    model = None
+                    tile_size_str = ""
+                    if chain is not None:
+                        resize_width_before_upscale = chain[
+                            "ResizeWidthBeforeUpscale"
+                        ]
+                        resize_height_before_upscale = chain[
+                            "ResizeHeightBeforeUpscale"
+                        ]
+                        resize_factor_before_upscale = chain[
+                            "ResizeFactorBeforeUpscale"
+                        ]
 
-                            if (
-                                resize_height_before_upscale != 0
-                                and resize_width_before_upscale != 0
-                            ):
-                                h, w, _ = get_h_w_c(image)
-                                image = standard_resize(
-                                    image,
-                                    (
-                                        resize_width_before_upscale,
-                                        resize_height_before_upscale,
+                        if (
+                            resize_height_before_upscale != 0
+                            and resize_width_before_upscale != 0
+                        ):
+                            h, w, _ = get_h_w_c(image)
+                            image = standard_resize(
+                                image,
+                                (
+                                    resize_width_before_upscale,
+                                    resize_height_before_upscale,
+                                ),
+                            )
+                        elif resize_height_before_upscale != 0:
+                            h, w, _ = get_h_w_c(image)
+                            image = standard_resize(
+                                image,
+                                (
+                                    round(
+                                        w * resize_height_before_upscale / h
                                     ),
-                                )
-                            elif resize_height_before_upscale != 0:
-                                h, w, _ = get_h_w_c(image)
-                                image = standard_resize(
-                                    image,
-                                    (
-                                        round(
-                                            w * resize_height_before_upscale / h
-                                        ),
-                                        resize_height_before_upscale,
+                                    resize_height_before_upscale,
+                                ),
+                            )
+                        elif resize_width_before_upscale != 0:
+                            h, w, _ = get_h_w_c(image)
+                            image = standard_resize(
+                                image,
+                                (
+                                    resize_width_before_upscale,
+                                    round(
+                                        h * resize_width_before_upscale / w
                                     ),
-                                )
-                            elif resize_width_before_upscale != 0:
-                                h, w, _ = get_h_w_c(image)
-                                image = standard_resize(
-                                    image,
-                                    (
-                                        resize_width_before_upscale,
-                                        round(
-                                            h * resize_width_before_upscale / w
-                                        ),
+                                ),
+                            )
+                        elif resize_factor_before_upscale != 100:
+                            h, w, _ = get_h_w_c(image)
+                            image = standard_resize(
+                                image,
+                                (
+                                    round(
+                                        w * resize_factor_before_upscale / 100
                                     ),
-                                )
-                            elif resize_factor_before_upscale != 100:
-                                h, w, _ = get_h_w_c(image)
-                                image = standard_resize(
-                                    image,
-                                    (
-                                        round(
-                                            w * resize_factor_before_upscale / 100
-                                        ),
-                                        round(
-                                            h * resize_factor_before_upscale / 100
-                                        ),
+                                    round(
+                                        h * resize_factor_before_upscale / 100
                                     ),
-                                )
-
-                            if is_grayscale and chain["AutoAdjustLevels"]:
-                                image = enhance_contrast(image, log=exec.reporter.log)
-                            else:
-                                image = normalize(image)
-
-                            model_abs_path = self.get_model_abs_path(
-                                chain["ModelFilePath"]
+                                ),
                             )
 
-                            if model_abs_path in self.loaded_models:
-                                model = self.loaded_models[model_abs_path]
-
-                            elif os.path.exists(model_abs_path):
-                                model, _, _ = load_model_node(
-                                    exec.context, Path(model_abs_path)
-                                )
-                                self.loaded_models[model_abs_path] = model
-
-                            tile_size_str = chain["ModelTileSize"]
+                        if is_grayscale and chain["AutoAdjustLevels"]:
+                            image = enhance_contrast(image, log=exec.reporter.log)
                         else:
                             image = normalize(image)
 
-                        self._put_up(
-                            upscale_queue,
-                            (
-                                image,
-                                decoded_filename,
-                                True,
-                                is_grayscale,
-                                original_width,
-                                original_height,
-                                get_tile_size(tile_size_str),
-                                model,
-                                decoded_filename,
-                            ),
-                            exec.controller,
+                        model_abs_path = self.get_model_abs_path(
+                            chain["ModelFilePath"]
                         )
+
+                        if model_abs_path in self.loaded_models:
+                            model = self.loaded_models[model_abs_path]
+
+                        elif os.path.exists(model_abs_path):
+                            model, _, _ = load_model_node(
+                                exec.context, Path(model_abs_path)
+                            )
+                            self.loaded_models[model_abs_path] = model
+
+                        tile_size_str = chain["ModelTileSize"]
+                    else:
+                        image = normalize(image)
+
+                    self._put_up(
+                        upscale_queue,
+                        (
+                            image,
+                            decoded_filename,
+                            True,
+                            is_grayscale,
+                            original_width,
+                            original_height,
+                            get_tile_size(tile_size_str),
+                            model,
+                            decoded_filename,
+                        ),
+                        exec.controller,
+                    )
                 except Aborted:
                     raise
                 except Exception as e:
@@ -1255,7 +1300,24 @@ class UpscaleEngine:
                                 continue
 
                             os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
-                            image = _read_image_from_path(os.path.join(root, filename))
+                            try:
+                                image = _read_image_from_path(os.path.join(root, filename))
+                            except Exception as e:
+                                self._log(
+                                    exec,
+                                    f"could not read as image: {os.path.join(root, filename)}, {e}",
+                                )
+                                exec.result.add(
+                                    {
+                                        "input": os.path.join(
+                                            input_folder_path, filename_rel
+                                        ),
+                                        "output": output_file_path,
+                                        "status": "error",
+                                        "error": str(e),
+                                    }
+                                )
+                                continue
 
                             chain, is_grayscale, original_width, original_height = (
                                 get_chain_for_image(
@@ -1442,7 +1504,19 @@ class UpscaleEngine:
                     return
 
                 os.makedirs(os.path.dirname(output_image_path), exist_ok=True)
-                image = _read_image_from_path(input_image_path)
+                try:
+                    image = _read_image_from_path(input_image_path)
+                except Exception as e:
+                    self._log(exec, f"could not read as image: {input_image_path}, {e}")
+                    exec.result.add(
+                        {
+                            "input": input_image_path,
+                            "output": output_image_path,
+                            "status": "error",
+                            "error": str(e),
+                        }
+                    )
+                    return
 
                 chain, is_grayscale, original_width, original_height = (
                     get_chain_for_image(

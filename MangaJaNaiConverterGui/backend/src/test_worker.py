@@ -8,7 +8,10 @@ import zipfile
 from io import BytesIO
 
 import numpy as np
-import pytest
+try:
+    import pytest
+except ImportError:
+    pytest = None
 from PIL import Image
 
 SRC = os.path.dirname(os.path.abspath(__file__))
@@ -168,8 +171,15 @@ def test_resolve_job_workflow_form():
 
 
 def test_resolve_job_missing_path_raises():
-    with pytest.raises(ValueError):
-        worker_mod.resolve_job({"id": "j", "input": {}}, make_workflow("/out"))
+    if pytest is not None:
+        with pytest.raises(ValueError):
+            worker_mod.resolve_job({"id": "j", "input": {}}, make_workflow("/out"))
+    else:
+        try:
+            worker_mod.resolve_job({"id": "j", "input": {}}, make_workflow("/out"))
+            assert False, "Expected ValueError"
+        except ValueError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -193,13 +203,24 @@ def test_worker_end_to_end(tmp_path):
     write_image(str(folder / "b.png"))
     cbz = tmp_path / "chap.cbz"
     with zipfile.ZipFile(str(cbz), "w") as z:
-        for name in ["p1.png", "p2.png"]:
+        # Include directory entry to verify directory skipping
+        z.writestr("chap/", b"")
+        for name in ["chap/p1.png", "chap/p2.png"]:
             buf = BytesIO()
             Image.fromarray(
                 (np.random.rand(16, 16, 3) * 255).astype(np.uint8), "RGB"
             ).save(buf, "PNG")
             z.writestr(name, buf.getvalue())
         z.writestr("notes.txt", b"hello")
+
+    cbz_upper = tmp_path / "chap_upper.CBZ"
+    with zipfile.ZipFile(str(cbz_upper), "w") as z:
+        z.writestr("folder/", b"")
+        buf = BytesIO()
+        Image.fromarray(
+            (np.random.rand(16, 16, 3) * 255).astype(np.uint8), "RGB"
+        ).save(buf, "PNG")
+        z.writestr("folder/page.png", buf.getvalue())
 
     w = WorkerClient(str(settings_path), capacity="3")
     assert w.read()["type"] == "ready"
@@ -232,7 +253,7 @@ def test_worker_end_to_end(tmp_path):
     assert (tmp_path / "o2" / "a.png").is_file()
     assert (tmp_path / "o2" / "b.png").is_file()
 
-    # archive (images upscaled, non-image copied)
+    # archive with dir entry (images upscaled, non-image copied, dir ignored)
     w.send(
         {
             "type": "job",
@@ -244,8 +265,21 @@ def test_worker_end_to_end(tmp_path):
     ev = w.read_until("done")
     assert ev["id"] == "z1" and ev["status"] == "ok", ev
     statuses = {f["output"]: f["status"] for f in ev["files"]}
-    assert statuses == {"p1.png": "upscaled", "p2.png": "upscaled", "notes.txt": "copied"}
+    assert statuses == {"chap/p1.png": "upscaled", "chap/p2.png": "upscaled", "notes.txt": "copied"}
     assert (tmp_path / "o3" / "chap.cbz").is_file()
+
+    # uppercase archive extension (.CBZ)
+    w.send(
+        {
+            "type": "job",
+            "id": "z2",
+            "input": {"path": str(cbz_upper), "kind": "archive"},
+            "output": {"folder": str(tmp_path / "o4"), "format": "png"},
+        }
+    )
+    ev = w.read_until("done")
+    assert ev["id"] == "z2" and ev["status"] == "ok", ev
+    assert (tmp_path / "o4" / "chap_upper.cbz").is_file()
 
     w.shutdown()
 
