@@ -17,6 +17,7 @@ consecutive jobs stay warm exactly like a bulk chapter run.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import queue
@@ -25,10 +26,20 @@ import threading
 import time
 from typing import Any
 
+import torch
+
+# Let the CUDA caching allocator return freed blocks to the driver more readily,
+# so releasing the cache while idle actually lowers the resident VRAM footprint.
+# Must be set before torch initializes its allocator; an explicit user override
+# is respected.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 sys_path = os.path.normpath(os.path.dirname(os.path.abspath(__file__)))
 if sys_path not in sys.path:
     sys.path.append(sys_path)
 
+from accelerator_detection import AcceleratorType, get_accelerator_detector  # noqa: E402
+from nodes.impl.pytorch.utils import safe_accelerator_cache_empty  # noqa: E402
 from progress_controller import ProgressController  # noqa: E402
 from upscale_engine import (  # noqa: E402
     ARCHIVE_EXTENSIONS,
@@ -197,8 +208,18 @@ class _JobReporter(ProgressReporter):
 
 
 class Worker:
-    def __init__(self, settings: dict[str, Any], queue_capacity: int, warmup: bool) -> None:
+    def __init__(
+        self,
+        settings: dict[str, Any],
+        queue_capacity: int,
+        warmup: bool,
+        cache_release_idle: float = 0.0,
+    ) -> None:
+        self.settings = settings
         self.queue_capacity = max(1, int(queue_capacity))
+        # Seconds of idleness after which cached VRAM is returned to the driver
+        # (0 disables). See _release_accelerator_cache.
+        self.cache_release_idle = max(0.0, float(cache_release_idle))
         self._lock = threading.Lock()
         self._job_queue: queue.Queue[Any] = queue.Queue()
         self._outstanding = 0
@@ -236,6 +257,62 @@ class Worker:
         with self._lock:
             capacity = self.queue_capacity - self._outstanding
             self._write({"type": "ready", "capacity": capacity, "device": self.device_info})
+
+    # -- accelerator cache release ------------------------------------------ #
+
+    def _accelerator_torch_device(self) -> torch.device | None:
+        """Resolve the torch device the engine runs inference on.
+
+        Mirrors ``PyTorchSettings.device`` in
+        ``packages/chaiNNer_pytorch/settings.py`` so we release the cache of the
+        same device the engine actually uses. Returns ``None`` for CPU mode.
+        """
+        index = self.settings.get("SelectedDeviceIndex", 0)
+        index = int(index) if isinstance(index, (int, float)) else 0
+        if index <= 0:
+            return None  # CPU mode: nothing cached on an accelerator
+
+        gpu_devices = [
+            device
+            for device in get_accelerator_detector().available_devices
+            if device.type != AcceleratorType.CPU
+        ]
+        if gpu_devices and 0 <= index < len(gpu_devices):
+            return gpu_devices[index].torch_device
+
+        best = get_accelerator_detector().get_best_device(prefer_gpu=True)
+        if best is not None and best.type != AcceleratorType.CPU:
+            return best.torch_device
+        return None
+
+    def _release_accelerator_cache(self) -> None:
+        """Return cached allocator blocks to the driver while idle.
+
+        The PyTorch caching allocator retains freed blocks up to the run's
+        high-water mark, which can starve co-tenant GPU processes (e.g. the
+        manga-vert-split-nn detection model in MangaIngestWithUpscaling).
+        Releasing the cache keeps the engine, models and CUDA context warm while
+        shrinking the idle VRAM footprint to roughly weights + context.
+        """
+        try:
+            device = self._accelerator_torch_device()
+            if device is None:
+                gc.collect()
+                return
+            safe_accelerator_cache_empty(device)
+        except Exception as e:  # noqa: BLE001 -- best-effort, never fail a job over this
+            sys.stderr.write(f"accelerator cache release failed: {e}\n")
+
+    def _handle_release_cache(self) -> None:
+        with self._lock:
+            busy = self._current_id is not None
+        if busy:
+            # Freeing cached blocks mid-job would only slow down the running
+            # inference; the host needs this while we are idle.
+            self.emit({"type": "cache_released", "status": "busy"})
+            return
+        self._release_accelerator_cache()
+        self.emit({"type": "cache_released", "status": "ok"})
 
     # -- request handling --------------------------------------------------- #
 
@@ -370,8 +447,25 @@ class Worker:
             self._cancelled.discard(job_id)
 
     def _job_loop(self) -> None:
+        poll = 0.5
+        idle_since: float | None = None
         while True:
-            job = self._job_queue.get()
+            try:
+                job = self._job_queue.get(timeout=poll)
+                idle_since = None
+            except queue.Empty:
+                if self._shutdown:
+                    break
+                # While idle, give cached VRAM back to the driver so co-tenant
+                # processes can use the GPU; the next job re-populates the cache.
+                if self.cache_release_idle > 0 and self._current_id is None:
+                    now = time.monotonic()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= self.cache_release_idle:
+                        self._release_accelerator_cache()
+                        idle_since = None
+                continue
             if job is None:
                 break
             self._run_job(job)
@@ -400,6 +494,8 @@ class Worker:
                 self._accept(msg)
             elif mtype == "cancel":
                 self._cancel(msg.get("id"))
+            elif mtype == "release_cache":
+                self._handle_release_cache()
             elif mtype == "shutdown":
                 self._shutdown = True
                 break
@@ -509,12 +605,22 @@ def main() -> None:
         action="store_true",
         help="Preload all chain models before emitting the first 'ready' event.",
     )
+    parser.add_argument(
+        "--cache-release-idle",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds of idleness after which cached VRAM is returned to the driver "
+            "(0 disables). Keeps the engine warm while shrinking the idle VRAM "
+            "footprint so co-tenant GPU processes can run. Default: 0"
+        ),
+    )
     args = parser.parse_args()
 
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore
 
     settings = _load_settings(args)
-    Worker(settings, args.queue_capacity, args.warmup).run()
+    Worker(settings, args.queue_capacity, args.warmup, args.cache_release_idle).run()
 
 
 if __name__ == "__main__":

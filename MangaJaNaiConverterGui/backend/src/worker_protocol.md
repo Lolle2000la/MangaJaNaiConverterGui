@@ -37,6 +37,7 @@ python worker.py -m ../models --device-index 1 -u 2 -o ./out
 | `-o/--output-folder-path` | `./out` | Default output dir (only when no settings file). |
 | `--queue-capacity N` | `1` | Max number of in-flight + queued jobs. |
 | `--warmup` | off | Preload all chain models before the first `ready`. |
+| `--cache-release-idle S` | `0` | Seconds of idleness after which cached VRAM is returned to the driver (0 disables). Keeps the engine warm while shrinking the idle VRAM footprint so co-tenant GPU processes can run. |
 
 Even without `--warmup`, models are loaded lazily on first use and cached in
 the engine, so consecutive jobs that use the same models stay warm.
@@ -110,6 +111,19 @@ with a `cancelled` event immediately and a `done` event with
 
 Stops accepting new jobs, finishes already-queued and in-flight jobs, then
 exits. Closing stdin has the same effect.
+
+### `release_cache`
+
+```json
+{"type": "release_cache"}
+```
+
+Asks the worker to return its cached allocator blocks (VRAM) to the driver so
+co-tenant GPU processes can run alongside an idle worker. The engine, models
+and CUDA context stay warm, so the next job starts without a cold restart.
+While a job is in flight the release is skipped (freeing cached blocks mid-job
+would only slow the running inference) and the reply reports `"busy"`. The
+worker replies with a `cache_released` event either way.
 
 ### `ping`
 
@@ -212,6 +226,16 @@ Acknowledges a `cancel` request.
 ```json
 {"type": "pong"}
 ```
+
+### `cache_released`
+
+```json
+{"type": "cache_released", "status": "ok"}
+```
+
+Reply to a `release_cache` request. `status` is `"ok"` when cached VRAM was
+returned to the driver, or `"busy"` when the request arrived while a job was
+in flight and the release was skipped.
 
 ### `exited`
 

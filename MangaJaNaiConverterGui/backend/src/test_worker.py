@@ -284,6 +284,26 @@ def test_worker_end_to_end(tmp_path):
     w.shutdown()
 
 
+def test_worker_release_cache_while_idle(tmp_path):
+    """release_cache is acknowledged while the worker is idle."""
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps(make_settings(str(out_dir), str(models_dir))))
+
+    w = WorkerClient(str(settings_path), capacity="1")
+    assert w.read()["type"] == "ready"
+
+    # Idle: the release runs and is acknowledged.
+    w.send({"type": "release_cache"})
+    ev = w.read_until("cache_released")
+    assert ev["status"] == "ok", ev
+
+    w.shutdown()
+
+
 def test_worker_flow_control_and_cancel(tmp_path):
     models_dir = tmp_path / "models"
     models_dir.mkdir()
