@@ -398,3 +398,12 @@ FodyWeavers.xsd
 *.sln.iml
 
 MangaJaNaiConverterGui/chaiNNer/python/
+
+# Python (backend) development artifacts
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Intentionally not tracked: the backend pins its dependency floors in
+# pyproject.toml; regenerate the lock locally with `uv lock` if wanted.
+uv.lock
