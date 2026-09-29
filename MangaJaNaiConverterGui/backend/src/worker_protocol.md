@@ -92,6 +92,40 @@ A job may be described two ways.
 {"type": "job", "id": "chap-01", "workflow": {"SelectedTabIndex": 0, "InputFilePath": "/data/ch1.cbz", "OutputFolderPath": "/out", "...": "..."}}
 ```
 
+### `open_chapter` / `page` / `close_chapter`
+
+Stream a chapter as individual pages instead of a whole CBZ. The worker starts
+upscaling as soon as the first page arrives and emits `page_done` for each page
+as it is written, so the driver can stream results back before the chapter ends.
+A chapter is one job slot: `open_chapter` counts against `--queue-capacity`, and
+a second `job`/`open_chapter` is rejected while it is outstanding.
+
+```json
+{"type": "open_chapter", "id": "chap-01", "output": {"folder": "/out", "format": "webp", "quality": 80}, "options": {"scale": 2}, "total_pages": 42}
+{"type": "page", "id": "chap-01", "index": 0, "name": "001.jpg", "path": "/tmp/pages/001.jpg"}
+{"type": "page", "id": "chap-01", "index": 1, "name": "002.jpg", "path": "/tmp/pages/002.jpg"}
+{"type": "close_chapter", "id": "chap-01"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Required, unique, echoed on every related event. |
+| `output.*` / `options.*` / `chains` / `grayscale_detection_threshold` | Same as `job` (see above); a chapter has no single `input.path`. |
+| `total_pages` | Optional, only used for progress totals. |
+| `page.index` | Caller's page ordinal, echoed on `page_done`. |
+| `page.name` | Source entry name (used to derive the output `<stem>.<format>` and to match `page_done`). |
+| `page.path` | Path to a file containing the page image; the driver owns it and may delete it after `page_done`. |
+
+Pages are read from `page.path`, so the driver writes each incoming page to a
+temporary file first. The input queue is unbounded (it only holds paths); the
+engine's internal queues bound how many decoded images are in flight. A page that
+cannot be decoded or prepared is reported as `page_done` with `status: "error"`
+and does not abort the chapter.
+
+`close_chapter` terminates the stream and lets the chapter finish; the final
+`done` event carries the complete `files` list. If the driver disconnects without
+sending it, the chapter waits (send `cancel` or `close_chapter`).
+
 ### `cancel`
 
 ```json
@@ -124,6 +158,17 @@ and CUDA context stay warm, so the next job starts without a cold restart.
 While a job is in flight the release is skipped (freeing cached blocks mid-job
 would only slow the running inference) and the reply reports `"busy"`. The
 worker replies with a `cache_released` event either way.
+
+### `preload`
+
+```json
+{"type": "preload", "chains": [{"ModelFilePath": "2x_MangaJaNai_...pth", "...": "..."}]}
+```
+
+Preloads the models referenced by `chains` (or the default workflow's chains when
+omitted) so the first page of a chapter does not pay the model-load cost. Replies
+with `preloaded` carrying the number of newly loaded models. Safe to call while a
+job is in flight; the model cache is thread-safe.
 
 ### `ping`
 
@@ -204,6 +249,26 @@ from "finishing the archive".
 
 For archive jobs, `output` is the entry name inside the output `.cbz`; the
 archive path itself is known from the request.
+
+### `page_done`
+
+```json
+{"type": "page_done", "id": "chap-01", "index": 0, "input": "001.jpg", "output": "/out/001.webp", "status": "upscaled"}
+{"type": "page_done", "id": "chap-01", "index": 3, "input": "004.jpg", "output": "004.jpg", "status": "error", "error": "..."}
+```
+
+Emitted for a chapter as soon as each page is on disk (or has failed), before the
+final `done`. `index` is the caller's page ordinal, `input` the source entry name
+and `output` the path the page was written to. `status` matches the `done` file
+statuses (`upscaled` / `copied` / `skipped` / `error`).
+
+### `preloaded`
+
+```json
+{"type": "preloaded", "loaded": 1}
+```
+
+Reply to `preload`; `loaded` is the number of models newly loaded into the cache.
 
 ### `error`
 

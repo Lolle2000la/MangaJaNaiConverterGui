@@ -8,6 +8,7 @@ import zipfile
 from io import BytesIO
 
 import numpy as np
+
 try:
     import pytest
 except ImportError:
@@ -149,7 +150,11 @@ def test_detect_kind(tmp_path):
 def test_resolve_job_simple_merges_defaults():
     base = make_workflow("/base/out")
     params = worker_mod.resolve_job(
-        {"id": "j", "input": {"path": "/in/a.png"}, "output": {"folder": "/custom", "format": "webp"}},
+        {
+            "id": "j",
+            "input": {"path": "/in/a.png"},
+            "output": {"folder": "/custom", "format": "webp"},
+        },
         base,
     )
     assert params["kind"] == "file"
@@ -164,7 +169,9 @@ def test_resolve_job_workflow_form():
     wf = make_workflow("/wf/out")
     wf["SelectedTabIndex"] = 1
     wf["InputFolderPath"] = "/in/folder"
-    params = worker_mod.resolve_job({"id": "j", "workflow": wf}, make_workflow("/base/out"))
+    params = worker_mod.resolve_job(
+        {"id": "j", "workflow": wf}, make_workflow("/base/out")
+    )
     assert params["kind"] == "folder"
     assert params["path"] == "/in/folder"
     assert params["output_folder"] == "/wf/out"
@@ -217,9 +224,9 @@ def test_worker_end_to_end(tmp_path):
     with zipfile.ZipFile(str(cbz_upper), "w") as z:
         z.writestr("folder/", b"")
         buf = BytesIO()
-        Image.fromarray(
-            (np.random.rand(16, 16, 3) * 255).astype(np.uint8), "RGB"
-        ).save(buf, "PNG")
+        Image.fromarray((np.random.rand(16, 16, 3) * 255).astype(np.uint8), "RGB").save(
+            buf, "PNG"
+        )
         z.writestr("folder/page.png", buf.getvalue())
 
     w = WorkerClient(str(settings_path), capacity="3")
@@ -265,7 +272,11 @@ def test_worker_end_to_end(tmp_path):
     ev = w.read_until("done")
     assert ev["id"] == "z1" and ev["status"] == "ok", ev
     statuses = {f["output"]: f["status"] for f in ev["files"]}
-    assert statuses == {"chap/p1.png": "upscaled", "chap/p2.png": "upscaled", "notes.txt": "copied"}
+    assert statuses == {
+        "chap/p1.png": "upscaled",
+        "chap/p2.png": "upscaled",
+        "notes.txt": "copied",
+    }
     assert (tmp_path / "o3" / "chap.cbz").is_file()
 
     # uppercase archive extension (.CBZ)
@@ -351,3 +362,207 @@ def test_worker_flow_control_and_cancel(tmp_path):
     assert done["status"] == "cancelled"
 
     w.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Streaming chapter jobs
+# --------------------------------------------------------------------------- #
+
+
+def collect_until(client: "WorkerClient", event_type: str, timeout: float = 60):
+    events = []
+    while True:
+        event = client.read(timeout)
+        if event is None:
+            return events
+        events.append(event)
+        if event.get("type") == event_type:
+            return events
+
+
+def make_chapter_settings(tmp_path) -> tuple[str, str]:
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    out_dir = tmp_path / "chapter_out"
+    out_dir.mkdir()
+    settings_path = tmp_path / "chapter_settings.json"
+    settings_path.write_text(json.dumps(make_settings(str(out_dir), str(models_dir))))
+    return str(settings_path), str(out_dir)
+
+
+def test_resolve_chapter_job_merges_defaults():
+    base = make_workflow("/base/out")
+    params = worker_mod.resolve_chapter_job(
+        {
+            "id": "ch",
+            "output": {"folder": "/custom", "format": "webp"},
+            "total_pages": 7,
+        },
+        base,
+    )
+    assert params["output_folder"] == "/custom"
+    assert params["image_format"] == "webp"
+    assert params["target_scale"] == 2
+    assert params["total_pages"] == 7
+    assert params["chains"] == base["Chains"]["$values"]
+
+
+def test_worker_chapter_streams_pages(tmp_path):
+    settings_path, out_dir = make_chapter_settings(tmp_path)
+
+    pages = []
+    for i in range(3):
+        page = tmp_path / f"page_{i:03d}.png"
+        write_image(str(page))
+        pages.append(page)
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    w.send(
+        {
+            "type": "open_chapter",
+            "id": "ch1",
+            "output": {"folder": out_dir, "format": "png"},
+            "total_pages": len(pages),
+        }
+    )
+    assert w.read_until("accepted")["id"] == "ch1"
+
+    for index, page in enumerate(pages):
+        w.send(
+            {
+                "type": "page",
+                "id": "ch1",
+                "index": index,
+                "name": page.name,
+                "path": str(page),
+            }
+        )
+    w.send({"type": "close_chapter", "id": "ch1"})
+
+    events = collect_until(w, "done")
+    page_done = [e for e in events if e["type"] == "page_done"]
+    assert len(page_done) == 3, events
+    assert {e["index"] for e in page_done} == {0, 1, 2}
+    assert all(e["status"] == "upscaled" for e in page_done)
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["id"] == "ch1"
+    assert done["status"] == "ok"
+    assert len(done["files"]) == 3
+    for page in pages:
+        assert (tmp_path / "chapter_out" / page.name).is_file()
+
+    w.shutdown()
+
+
+def test_worker_chapter_reports_bad_page_without_failing(tmp_path):
+    settings_path, out_dir = make_chapter_settings(tmp_path)
+    good = tmp_path / "good.png"
+    write_image(str(good))
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    w.send(
+        {
+            "type": "open_chapter",
+            "id": "ch2",
+            "output": {"folder": out_dir, "format": "png"},
+            "total_pages": 2,
+        }
+    )
+    assert w.read_until("accepted")["id"] == "ch2"
+    w.send(
+        {"type": "page", "id": "ch2", "index": 0, "name": good.name, "path": str(good)}
+    )
+    w.send(
+        {
+            "type": "page",
+            "id": "ch2",
+            "index": 1,
+            "name": "missing.png",
+            "path": str(tmp_path / "missing.png"),
+        }
+    )
+    w.send({"type": "close_chapter", "id": "ch2"})
+
+    events = collect_until(w, "done")
+    page_done = [e for e in events if e["type"] == "page_done"]
+    assert len(page_done) == 2, events
+    statuses = {e["index"]: e["status"] for e in page_done}
+    assert statuses == {0: "upscaled", 1: "error"}
+
+    done = events[-1]
+    assert done["status"] == "ok"
+    assert (tmp_path / "chapter_out" / good.name).is_file()
+
+    w.shutdown()
+
+
+def test_worker_chapter_cancel_before_start(tmp_path):
+    settings_path, out_dir = make_chapter_settings(tmp_path)
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    w.send(
+        {
+            "type": "open_chapter",
+            "id": "ch3",
+            "output": {"folder": out_dir, "format": "png"},
+        }
+    )
+    assert w.read_until("accepted")["id"] == "ch3"
+    w.send({"type": "cancel", "id": "ch3"})
+    done = w.read_until("done")
+    assert done["id"] == "ch3"
+    assert done["status"] == "cancelled"
+
+    w.shutdown()
+
+
+def test_worker_preload_command(tmp_path):
+    settings_path, _out_dir = make_chapter_settings(tmp_path)
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    # The No-Model chain has nothing to preload, but the command must answer.
+    w.send({"type": "preload"})
+    preloaded = w.read_until("preloaded")
+    assert preloaded["loaded"] == 0
+
+    w.shutdown()
+
+
+def test_engine_upscale_image_bytes(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    engine = worker_mod.UpscaleEngine(
+        make_settings(str(tmp_path / "out"), str(models_dir))
+    )
+
+    buffer = BytesIO()
+    Image.fromarray((np.random.rand(24, 24, 3) * 255).astype(np.uint8), "RGB").save(
+        buffer, "PNG"
+    )
+
+    encoded = engine.upscale_image_bytes(
+        buffer.getvalue(),
+        "png",
+        80,
+        False,
+        2,
+        0,
+        0,
+        [NO_MODEL_CHAIN],
+        12,
+    )
+    assert encoded[:8] == b"\x89PNG\r\n\x1a\n"
+
+    with Image.open(BytesIO(encoded)) as result:
+        # A 2x scale with no model still resizes the output to 48x48.
+        assert result.size == (48, 48)

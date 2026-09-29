@@ -7,15 +7,15 @@ without being tied to a specific frontend (CLI, GUI, or worker).  The
 loaded between jobs so the GPU stays warm across many jobs, exactly like a bulk
 chapter run through the GUI or the CLI.
 
-Only the *postprocess* step runs in a separate process (because of pyvips); the
-preprocess and upscale steps run in threads of the calling process, so the model
-cache in :attr:`UpscaleEngine.loaded_models` persists across jobs.
+Only the *postprocess* stage is isolated behind :func:`_run_postprocess` (a
+thread wrapper that turns an encode crash into an abort plus a recorded error);
+the preprocess and upscale stages run in threads of the calling process too, so
+the model cache in :attr:`UpscaleEngine.loaded_models` persists across jobs.
 """
 
 from __future__ import annotations
 
 import ctypes
-import io
 import os
 import platform
 import queue
@@ -73,6 +73,9 @@ from api import (
 
 UPSCALE_SENTINEL = (None, None, None, None, None, None, None, None, None)
 POSTPROCESS_SENTINEL = (None, None, None, None, None, None, None)
+# Marks the end of the page stream in a chapter job's input queue. A unique
+# object (rather than a tuple) so it can never collide with a real page.
+PAGE_SENTINEL = object()
 
 CV2_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 IMAGE_EXTENSIONS = (*CV2_IMAGE_EXTENSIONS, ".avif")
@@ -491,10 +494,8 @@ def _vips_from_array(image: np.ndarray) -> pyvips.Image:
     return vips_img
 
 
-def save_image_zip(
+def encode_image(
     image: np.ndarray,
-    file_name: str,
-    output_zip: ZipFile,
     image_format: str,
     lossy_compression_quality: int,
     use_lossless_compression: bool,
@@ -504,7 +505,12 @@ def save_image_zip(
     target_width: int,
     target_height: int,
     is_grayscale: bool,
-) -> None:
+) -> bytes:
+    """Encode an upscaled image to bytes in the target format.
+
+    Shared by the archive/folder/image sinks and the page streaming path, so a
+    streamed page is byte-identical to the same page inside a bulk archive run.
+    """
     image = to_uint8(image, normalized=True)
 
     image = final_target_resize(
@@ -520,10 +526,35 @@ def save_image_zip(
     args = {"Q": int(lossy_compression_quality)}
     if image_format in {"webp"}:
         args["lossless"] = use_lossless_compression
-    buf_img = _vips_from_array(image).write_to_buffer(f".{image_format}", **args)
-    output_buffer = io.BytesIO(buf_img)  # type: ignore
+    return _vips_from_array(image).write_to_buffer(f".{image_format}", **args)
 
-    upscaled_image_data = output_buffer.getvalue()
+
+def save_image_zip(
+    image: np.ndarray,
+    file_name: str,
+    output_zip: ZipFile,
+    image_format: str,
+    lossy_compression_quality: int,
+    use_lossless_compression: bool,
+    original_width: int,
+    original_height: int,
+    target_scale: float,
+    target_width: int,
+    target_height: int,
+    is_grayscale: bool,
+) -> None:
+    upscaled_image_data = encode_image(
+        image,
+        image_format,
+        lossy_compression_quality,
+        use_lossless_compression,
+        original_width,
+        original_height,
+        target_scale,
+        target_width,
+        target_height,
+        is_grayscale,
+    )
 
     output_zip.writestr(file_name, upscaled_image_data)
 
@@ -560,7 +591,7 @@ def save_image(
 
 
 # --------------------------------------------------------------------------- #
-# Postprocess workers (run in a separate process)
+# Postprocess workers (run on a dedicated thread, isolated behind _run_postprocess)
 # --------------------------------------------------------------------------- #
 
 
@@ -630,13 +661,27 @@ def _postprocess_worker_zip(
                     is_grayscale,
                 )
                 progress_queue.put(
-                    ("result", {"input": input_name, "output": entry_name, "status": "upscaled"})
+                    (
+                        "result",
+                        {
+                            "input": input_name,
+                            "output": entry_name,
+                            "status": "upscaled",
+                        },
+                    )
                 )
             else:
                 if image is not None and isinstance(image, (bytes, str)):
                     output_zip.writestr(file_name, image)
                     progress_queue.put(
-                        ("result", {"input": input_name, "output": file_name, "status": "copied"})
+                        (
+                            "result",
+                            {
+                                "input": input_name,
+                                "output": file_name,
+                                "status": "copied",
+                            },
+                        )
                     )
             progress_queue.put(("progress", "postprocess_worker_zip_image"))
         if not controller.aborted:
@@ -694,7 +739,10 @@ def _postprocess_worker_folder(
             is_grayscale,
         )
         progress_queue.put(
-            ("result", {"input": input_name, "output": output_file_path, "status": "upscaled"})
+            (
+                "result",
+                {"input": input_name, "output": output_file_path, "status": "upscaled"},
+            )
         )
         progress_queue.put(("progress", "postprocess_worker_folder"))
 
@@ -747,13 +795,96 @@ def _postprocess_worker_image(
             is_grayscale,
         )
         progress_queue.put(
-            ("result", {"input": input_name, "output": output_file_path, "status": "upscaled"})
+            (
+                "result",
+                {"input": input_name, "output": output_file_path, "status": "upscaled"},
+            )
         )
         progress_queue.put(("progress", "postprocess_worker_image"))
 
 
+def _postprocess_worker_pages(
+    controller: ProgressController,
+    postprocess_queue: Queue,
+    progress_queue: Queue,
+    output_folder: str,
+    image_format: str,
+    lossy_compression_quality: int,
+    use_lossless_compression: bool,
+    target_scale: float,
+    target_width: int,
+    target_height: int,
+    on_page_done: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    """Encode finished pages to ``output_folder`` and report each immediately.
+
+    Unlike the archive sink, there is no output zip: the driver owns assembly, so
+    every page is written as ``<stem>.<image_format>`` and handed to
+    ``on_page_done`` as soon as it is on disk.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    while True:
+        if controller.aborted:
+            break
+        try:
+            item = postprocess_queue.get(timeout=_QUEUE_TIMEOUT)
+        except queue.Empty:
+            continue
+        if item is POSTPROCESS_SENTINEL:
+            break
+        (
+            image,
+            file_name,
+            is_image,
+            is_grayscale,
+            original_width,
+            original_height,
+            input_name,
+        ) = item
+        if image is None:
+            break
+
+        if is_image:
+            stem = Path(file_name).stem
+            output_file_path = os.path.join(output_folder, f"{stem}.{image_format}")
+            try:
+                data = encode_image(
+                    image,
+                    image_format,
+                    lossy_compression_quality,
+                    use_lossless_compression,
+                    original_width,
+                    original_height,
+                    target_scale,
+                    target_width,
+                    target_height,
+                    is_grayscale,
+                )
+                with open(output_file_path, "wb") as handle:
+                    handle.write(data)
+                result = {
+                    "input": input_name,
+                    "output": output_file_path,
+                    "status": "upscaled",
+                }
+            except Exception as e:  # noqa: BLE001 - one bad page must not kill the chapter
+                result = {
+                    "input": input_name,
+                    "output": output_file_path,
+                    "status": "error",
+                    "error": str(e),
+                }
+        else:
+            result = {"input": input_name, "output": file_name, "status": "copied"}
+
+        progress_queue.put(("result", result))
+        if on_page_done is not None:
+            on_page_done(result)
+        progress_queue.put(("progress", "postprocess_worker_page"))
+
+
 # --------------------------------------------------------------------------- #
-# ICC profiles (module-level so postprocess subprocesses inherit/re-create them)
+# ICC profiles (module-level so the postprocess thread and jobs share them)
 # --------------------------------------------------------------------------- #
 
 current_file_directory = os.path.dirname(os.path.abspath(__file__))
@@ -823,6 +954,9 @@ class UpscaleEngine:
         self.models_directory = models_directory or settings["ModelsDirectory"]
         self.system_codepage = get_system_codepage()
         self.loaded_models: dict[str, ModelDescriptor] = {}
+        # Guards lazy model loading: warmup/preload runs on the stdin thread while
+        # a chapter job's preprocess thread may also load models.
+        self._models_lock = threading.Lock()
         self.reporter: ProgressReporter = reporter or _NoopReporter()
 
     # -- helpers ------------------------------------------------------------ #
@@ -849,7 +983,26 @@ class UpscaleEngine:
                 continue
 
     def get_model_abs_path(self, chain_model_file_path: str) -> str:
-        return os.path.abspath(os.path.join(self.models_directory, chain_model_file_path))
+        return os.path.abspath(
+            os.path.join(self.models_directory, chain_model_file_path)
+        )
+
+    def _get_or_load_model(
+        self, exec: _JobExecution, model_abs_path: str
+    ) -> ModelDescriptor:
+        """Return the cached model for ``model_abs_path``, loading it once.
+
+        Thread-safe so a ``preload``/``warmup`` on the reader thread and a
+        chapter's preprocess thread cannot load (or register) the same model
+        twice or corrupt the cache.
+        """
+        with self._models_lock:
+            model = self.loaded_models.get(model_abs_path)
+            if model is not None:
+                return model
+            model, _, _ = load_model_node(exec.context, Path(model_abs_path))
+            self.loaded_models[model_abs_path] = model
+            return model
 
     def _forward_progress(
         self, progress_queue: Queue, reporter: ProgressReporter, result: JobResult
@@ -875,7 +1028,7 @@ class UpscaleEngine:
         """
         loaded = 0
         controller = ProgressController()
-        context = _ExecutorNodeContext(controller, self.settings_parser, Path())
+        exec = self._make_exec(None, controller)
         for chain in chains:
             model_file_path = chain.get("ModelFilePath")
             if not model_file_path or model_file_path == "No Model":
@@ -884,8 +1037,7 @@ class UpscaleEngine:
             if abs_path in self.loaded_models:
                 continue
             if os.path.exists(abs_path):
-                model, _, _ = load_model_node(context, Path(abs_path))
-                self.loaded_models[abs_path] = model
+                self._get_or_load_model(exec, abs_path)
                 loaded += 1
         return loaded
 
@@ -1111,9 +1263,7 @@ class UpscaleEngine:
                     model = None
                     tile_size_str = ""
                     if chain is not None:
-                        resize_width_before_upscale = chain[
-                            "ResizeWidthBeforeUpscale"
-                        ]
+                        resize_width_before_upscale = chain["ResizeWidthBeforeUpscale"]
                         resize_height_before_upscale = chain[
                             "ResizeHeightBeforeUpscale"
                         ]
@@ -1138,9 +1288,7 @@ class UpscaleEngine:
                             image = standard_resize(
                                 image,
                                 (
-                                    round(
-                                        w * resize_height_before_upscale / h
-                                    ),
+                                    round(w * resize_height_before_upscale / h),
                                     resize_height_before_upscale,
                                 ),
                             )
@@ -1150,9 +1298,7 @@ class UpscaleEngine:
                                 image,
                                 (
                                     resize_width_before_upscale,
-                                    round(
-                                        h * resize_width_before_upscale / w
-                                    ),
+                                    round(h * resize_width_before_upscale / w),
                                 ),
                             )
                         elif resize_factor_before_upscale != 100:
@@ -1160,12 +1306,8 @@ class UpscaleEngine:
                             image = standard_resize(
                                 image,
                                 (
-                                    round(
-                                        w * resize_factor_before_upscale / 100
-                                    ),
-                                    round(
-                                        h * resize_factor_before_upscale / 100
-                                    ),
+                                    round(w * resize_factor_before_upscale / 100),
+                                    round(h * resize_factor_before_upscale / 100),
                                 ),
                             )
 
@@ -1174,9 +1316,7 @@ class UpscaleEngine:
                         else:
                             image = normalize(image)
 
-                        model_abs_path = self.get_model_abs_path(
-                            chain["ModelFilePath"]
-                        )
+                        model_abs_path = self.get_model_abs_path(chain["ModelFilePath"])
 
                         if model_abs_path in self.loaded_models:
                             model = self.loaded_models[model_abs_path]
@@ -1287,7 +1427,9 @@ class UpscaleEngine:
                             if not overwrite_existing_files and os.path.isfile(
                                 output_file_path
                             ):
-                                self._log(exec, f"file exists, skip: {output_file_path}")
+                                self._log(
+                                    exec, f"file exists, skip: {output_file_path}"
+                                )
                                 exec.result.add(
                                     {
                                         "input": os.path.join(
@@ -1299,9 +1441,13 @@ class UpscaleEngine:
                                 )
                                 continue
 
-                            os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+                            os.makedirs(
+                                os.path.dirname(output_file_path), exist_ok=True
+                            )
                             try:
-                                image = _read_image_from_path(os.path.join(root, filename))
+                                image = _read_image_from_path(
+                                    os.path.join(root, filename)
+                                )
                             except Exception as e:
                                 self._log(
                                     exec,
@@ -1364,9 +1510,7 @@ class UpscaleEngine:
                                     image = standard_resize(
                                         image,
                                         (
-                                            round(
-                                                w * resize_height_before_upscale / h
-                                            ),
+                                            round(w * resize_height_before_upscale / h),
                                             resize_height_before_upscale,
                                         ),
                                     )
@@ -1376,9 +1520,7 @@ class UpscaleEngine:
                                         image,
                                         (
                                             resize_width_before_upscale,
-                                            round(
-                                                h * resize_width_before_upscale / w
-                                            ),
+                                            round(h * resize_width_before_upscale / w),
                                         ),
                                     )
                                 elif resize_factor_before_upscale != 100:
@@ -1387,14 +1529,10 @@ class UpscaleEngine:
                                         image,
                                         (
                                             round(
-                                                w
-                                                * resize_factor_before_upscale
-                                                / 100
+                                                w * resize_factor_before_upscale / 100
                                             ),
                                             round(
-                                                h
-                                                * resize_factor_before_upscale
-                                                / 100
+                                                h * resize_factor_before_upscale / 100
                                             ),
                                         ),
                                     )
@@ -1443,7 +1581,9 @@ class UpscaleEngine:
                             if not overwrite_existing_files and os.path.isfile(
                                 output_file_path
                             ):
-                                self._log(exec, f"file exists, skip: {output_file_path}")
+                                self._log(
+                                    exec, f"file exists, skip: {output_file_path}"
+                                )
                                 exec.result.add(
                                     {
                                         "input": os.path.join(
@@ -1454,7 +1594,9 @@ class UpscaleEngine:
                                     }
                                 )
                                 continue
-                            os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
+                            os.makedirs(
+                                os.path.dirname(output_file_path), exist_ok=True
+                            )
 
                             self.upscale_archive_file(
                                 exec,
@@ -1476,6 +1618,97 @@ class UpscaleEngine:
                 self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
             except Aborted:
                 pass
+
+    def _prepare_image_for_upscale(
+        self,
+        exec: _JobExecution,
+        image: np.ndarray,
+        target_scale: float | None,
+        target_width: int,
+        target_height: int,
+        chains: list[dict[str, Any]],
+        grayscale_detection_threshold: int,
+    ) -> tuple[np.ndarray, bool, int, int, TileSize, ImageModelDescriptor | None]:
+        """Chain selection, resize/normalize and model lookup for one image.
+
+        Shared by the single-image and streaming-page preprocess stages so both
+        feed the upscaler identical input.
+        """
+        chain, is_grayscale, original_width, original_height = get_chain_for_image(
+            image,
+            target_scale,
+            target_width,
+            target_height,
+            chains,
+            grayscale_detection_threshold,
+            log=exec.reporter.log,
+        )
+
+        if is_grayscale:
+            image = convert_image_to_grayscale(image)
+
+        model: ImageModelDescriptor | None = None
+        tile_size_str = ""
+        if chain is not None:
+            resize_width_before_upscale = chain["ResizeWidthBeforeUpscale"]
+            resize_height_before_upscale = chain["ResizeHeightBeforeUpscale"]
+            resize_factor_before_upscale = chain["ResizeFactorBeforeUpscale"]
+
+            if resize_height_before_upscale != 0 and resize_width_before_upscale != 0:
+                image = standard_resize(
+                    image, (resize_width_before_upscale, resize_height_before_upscale)
+                )
+            elif resize_height_before_upscale != 0:
+                h, w, _ = get_h_w_c(image)
+                image = standard_resize(
+                    image,
+                    (
+                        round(w * resize_height_before_upscale / h),
+                        resize_height_before_upscale,
+                    ),
+                )
+            elif resize_width_before_upscale != 0:
+                h, w, _ = get_h_w_c(image)
+                image = standard_resize(
+                    image,
+                    (
+                        resize_width_before_upscale,
+                        round(h * resize_width_before_upscale / w),
+                    ),
+                )
+            elif resize_factor_before_upscale != 100:
+                h, w, _ = get_h_w_c(image)
+                image = standard_resize(
+                    image,
+                    (
+                        round(w * resize_factor_before_upscale / 100),
+                        round(h * resize_factor_before_upscale / 100),
+                    ),
+                )
+
+            if is_grayscale and chain["AutoAdjustLevels"]:
+                image = enhance_contrast(image, log=exec.reporter.log)
+            else:
+                image = normalize(image)
+
+            if chain["ModelFilePath"] != "No Model":
+                model_abs_path = self.get_model_abs_path(chain["ModelFilePath"])
+                if not os.path.exists(model_abs_path):
+                    raise FileNotFoundError(model_abs_path)
+                model = self._get_or_load_model(exec, model_abs_path)
+            tile_size_str = chain["ModelTileSize"]
+        else:
+            self._log(exec, "No chain matched; passing the image through unchanged.")
+            image = normalize(image)
+
+        return (
+            image,
+            is_grayscale,
+            original_width,
+            original_height,
+            get_tile_size(tile_size_str),
+            model,
+        )
 
     def _preprocess_worker_image(
         self,
@@ -1518,89 +1751,22 @@ class UpscaleEngine:
                     )
                     return
 
-                chain, is_grayscale, original_width, original_height = (
-                    get_chain_for_image(
-                        image,
-                        target_scale,
-                        target_width,
-                        target_height,
-                        chains,
-                        grayscale_detection_threshold,
-                        log=exec.reporter.log,
-                    )
+                (
+                    image,
+                    is_grayscale,
+                    original_width,
+                    original_height,
+                    tile_size,
+                    model,
+                ) = self._prepare_image_for_upscale(
+                    exec,
+                    image,
+                    target_scale,
+                    target_width,
+                    target_height,
+                    chains,
+                    grayscale_detection_threshold,
                 )
-
-                if is_grayscale:
-                    image = convert_image_to_grayscale(image)
-
-                model = None
-                tile_size_str = ""
-                if chain is not None:
-                    resize_width_before_upscale = chain["ResizeWidthBeforeUpscale"]
-                    resize_height_before_upscale = chain["ResizeHeightBeforeUpscale"]
-                    resize_factor_before_upscale = chain["ResizeFactorBeforeUpscale"]
-
-                    if (
-                        resize_height_before_upscale != 0
-                        and resize_width_before_upscale != 0
-                    ):
-                        h, w, _ = get_h_w_c(image)
-                        image = standard_resize(
-                            image, (resize_width_before_upscale, resize_height_before_upscale)
-                        )
-                    elif resize_height_before_upscale != 0:
-                        h, w, _ = get_h_w_c(image)
-                        image = standard_resize(
-                            image,
-                            (
-                                round(w * resize_height_before_upscale / h),
-                                resize_height_before_upscale,
-                            ),
-                        )
-                    elif resize_width_before_upscale != 0:
-                        h, w, _ = get_h_w_c(image)
-                        image = standard_resize(
-                            image,
-                            (
-                                resize_width_before_upscale,
-                                round(h * resize_width_before_upscale / w),
-                            ),
-                        )
-                    elif resize_factor_before_upscale != 100:
-                        h, w, _ = get_h_w_c(image)
-                        image = standard_resize(
-                            image,
-                            (
-                                round(w * resize_factor_before_upscale / 100),
-                                round(h * resize_factor_before_upscale / 100),
-                            ),
-                        )
-
-                    if is_grayscale and chain["AutoAdjustLevels"]:
-                        image = enhance_contrast(image, log=exec.reporter.log)
-                    else:
-                        image = normalize(image)
-
-                    if chain["ModelFilePath"] == "No Model":
-                        pass
-                    else:
-                        model_abs_path = self.get_model_abs_path(chain["ModelFilePath"])
-
-                        if not os.path.exists(model_abs_path):
-                            raise FileNotFoundError(model_abs_path)
-
-                        if model_abs_path in self.loaded_models:
-                            model = self.loaded_models[model_abs_path]
-
-                        elif os.path.exists(model_abs_path):
-                            model, _, _ = load_model_node(
-                                exec.context, Path(model_abs_path)
-                            )
-                            self.loaded_models[model_abs_path] = model
-                        tile_size_str = chain["ModelTileSize"]
-                else:
-                    self._log(exec, "No chain!!!!!!!")
-                    image = normalize(image)
 
                 self._put_up(
                     upscale_queue,
@@ -1611,9 +1777,109 @@ class UpscaleEngine:
                         is_grayscale,
                         original_width,
                         original_height,
-                        get_tile_size(tile_size_str),
+                        tile_size,
                         model,
                         input_image_path,
+                    ),
+                    exec.controller,
+                )
+        except Aborted:
+            pass
+        finally:
+            try:
+                self._put_up(upscale_queue, UPSCALE_SENTINEL, exec.controller)
+            except Aborted:
+                pass
+
+    def _preprocess_worker_pages(
+        self,
+        exec: _JobExecution,
+        upscale_queue: Queue,
+        page_queue: Queue,
+        target_scale: float | None,
+        target_width: int,
+        target_height: int,
+        chains: list[dict[str, Any]],
+        grayscale_detection_threshold: int,
+        on_page_done: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Decode and prepare pages streamed through ``page_queue``.
+
+        A page that cannot be decoded or prepared is reported as an error and
+        skipped; it must not abort the whole chapter. ``page_queue`` yields
+        ``(name, path)`` tuples and ends with :data:`PAGE_SENTINEL`.
+        """
+        try:
+            while True:
+                if exec.controller.aborted:
+                    break
+                try:
+                    item = page_queue.get(timeout=_QUEUE_TIMEOUT)
+                except queue.Empty:
+                    continue
+                if item is PAGE_SENTINEL:
+                    break
+
+                name, path = item
+                try:
+                    image = _read_image_from_path(path)
+                except Exception as e:
+                    self._log(exec, f"could not read page {name}: {e}")
+                    result = {
+                        "input": name,
+                        "output": name,
+                        "status": "error",
+                        "error": str(e),
+                    }
+                    exec.result.add(result)
+                    if on_page_done is not None:
+                        on_page_done(result)
+                    continue
+
+                try:
+                    (
+                        image,
+                        is_grayscale,
+                        original_width,
+                        original_height,
+                        tile_size,
+                        model,
+                    ) = self._prepare_image_for_upscale(
+                        exec,
+                        image,
+                        target_scale,
+                        target_width,
+                        target_height,
+                        chains,
+                        grayscale_detection_threshold,
+                    )
+                except Aborted:
+                    raise
+                except Exception as e:
+                    self._log(exec, f"could not prepare page {name}: {e}")
+                    result = {
+                        "input": name,
+                        "output": name,
+                        "status": "error",
+                        "error": str(e),
+                    }
+                    exec.result.add(result)
+                    if on_page_done is not None:
+                        on_page_done(result)
+                    continue
+
+                self._put_up(
+                    upscale_queue,
+                    (
+                        image,
+                        name,
+                        True,
+                        is_grayscale,
+                        original_width,
+                        original_height,
+                        tile_size,
+                        model,
+                        name,
                     ),
                     exec.controller,
                 )
@@ -1797,6 +2063,164 @@ class UpscaleEngine:
         except Exception:
             pass
         forwarder.join(timeout=5)
+
+    def upscale_pages(
+        self,
+        page_queue: Queue,
+        output_folder: str,
+        image_format: str,
+        lossy_compression_quality: int,
+        use_lossless_compression: bool,
+        target_scale: float | None,
+        target_width: int,
+        target_height: int,
+        chains: list[dict[str, Any]],
+        grayscale_detection_threshold: int,
+        reporter: ProgressReporter | None = None,
+        controller: ProgressController | None = None,
+        on_page_done: Callable[[dict[str, Any]], None] | None = None,
+    ) -> JobResult:
+        """Upscale pages streamed through ``page_queue`` as they arrive.
+
+        ``page_queue`` yields ``(name, path)`` tuples and is terminated with
+        :data:`PAGE_SENTINEL`. Pages flow through the same three-stage pipeline
+        as an archive job (preprocess -> GPU -> encode), so decoding page N+1
+        overlaps the GPU work for page N and the encode of page N-1.
+
+        Each finished page is written to ``output_folder`` as
+        ``<stem>.<image_format>`` and reported through ``on_page_done``
+        immediately, so a driver can stream it back before the chapter finishes.
+        The engine's internal queues are bounded (back-pressure); the input queue
+        is unbounded because it only carries file paths, not image bytes.
+        """
+        exec = self._make_exec(reporter, controller)
+        os.makedirs(output_folder, exist_ok=True)
+
+        upscale_queue: Queue = Queue(maxsize=1)
+        postprocess_queue: Queue = Queue(maxsize=1)
+        progress_queue: Queue = Queue()
+
+        forwarder = Thread(
+            target=self._forward_progress,
+            args=(progress_queue, exec.reporter, exec.result),
+            daemon=True,
+        )
+        forwarder.start()
+
+        preprocess_thread = Thread(
+            target=self._preprocess_worker_pages,
+            args=(
+                exec,
+                upscale_queue,
+                page_queue,
+                target_scale,
+                target_width,
+                target_height,
+                chains,
+                grayscale_detection_threshold,
+                on_page_done,
+            ),
+        )
+        preprocess_thread.start()
+
+        upscale_thread = Thread(
+            target=self._upscale_worker, args=(exec, upscale_queue, postprocess_queue)
+        )
+        upscale_thread.start()
+
+        postprocess_error: list[BaseException] = []
+        postprocess_thread = Thread(
+            target=_run_postprocess,
+            args=(
+                exec.controller,
+                _postprocess_worker_pages,
+                (
+                    exec.controller,
+                    postprocess_queue,
+                    progress_queue,
+                    output_folder,
+                    image_format,
+                    lossy_compression_quality,
+                    use_lossless_compression,
+                    target_scale,
+                    target_width,
+                    target_height,
+                    on_page_done,
+                ),
+                postprocess_error,
+            ),
+        )
+        postprocess_thread.start()
+
+        preprocess_thread.join()
+        upscale_thread.join()
+        if not exec.controller.aborted:
+            exec.reporter.phase("finalizing")
+        postprocess_thread.join()
+        if postprocess_error:
+            raise postprocess_error[0]
+
+        try:
+            progress_queue.put(None, timeout=1)
+        except Exception:
+            pass
+        forwarder.join(timeout=5)
+
+        return exec.result
+
+    def upscale_image_bytes(
+        self,
+        image_bytes: bytes,
+        image_format: str,
+        lossy_compression_quality: int,
+        use_lossless_compression: bool,
+        target_scale: float | None,
+        target_width: int,
+        target_height: int,
+        chains: list[dict[str, Any]],
+        grayscale_detection_threshold: int,
+        reporter: ProgressReporter | None = None,
+        controller: ProgressController | None = None,
+    ) -> bytes:
+        """Upscale a single in-memory image and return the encoded bytes.
+
+        Synchronous single-page path for drivers that prefer to keep pages in
+        memory. The pipelined, file-based :meth:`upscale_pages` is what the
+        streaming chapter job uses.
+        """
+        exec = self._make_exec(reporter, controller)
+        image = _read_vips(image_bytes)
+        (
+            image,
+            is_grayscale,
+            original_width,
+            original_height,
+            tile_size,
+            model,
+        ) = self._prepare_image_for_upscale(
+            exec,
+            image,
+            target_scale,
+            target_width,
+            target_height,
+            chains,
+            grayscale_detection_threshold,
+        )
+        image = self.ai_upscale_image(exec.context, image, tile_size, model)
+        if is_grayscale:
+            image = convert_image_to_grayscale(image)
+        return encode_image(
+            image,
+            image_format,
+            lossy_compression_quality,
+            use_lossless_compression,
+            original_width,
+            original_height,
+            target_scale,
+            target_width,
+            target_height,
+            is_grayscale,
+        )
 
     # -- public API --------------------------------------------------------- #
 

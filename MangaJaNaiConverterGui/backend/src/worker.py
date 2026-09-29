@@ -12,6 +12,11 @@ worker, writes ``{"type": "job", ...}`` lines to its stdin and reads ``ready`` /
 ``progress`` / ``done`` events from its stdout.  The worker keeps the
 ``UpscaleEngine`` (and therefore the model cache and GPU) alive across jobs, so
 consecutive jobs stay warm exactly like a bulk chapter run.
+
+Chapters can also be streamed page by page instead of as one archive: an
+``open_chapter`` request is followed by ``page`` messages and a
+``close_chapter``, and the worker emits a ``page_done`` event for every page as
+soon as it is written.  See ``worker_protocol.md``.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ from progress_controller import ProgressController  # noqa: E402
 from upscale_engine import (  # noqa: E402
     ARCHIVE_EXTENSIONS,
     IMAGE_EXTENSIONS,
+    PAGE_SENTINEL,
     ProgressReporter,
     UpscaleEngine,
     resolve_workflow_params,
@@ -93,15 +99,27 @@ def resolve_job(job: dict[str, Any], base_workflow: dict[str, Any]) -> dict[str,
         }
 
     inp = job.get("input") or {}
-    out = job.get("output") or {}
-    opts = job.get("options") or {}
-
     path = inp.get("path") or inp.get("input")
     if not path:
         raise ValueError("job.input.path is required")
     kind = inp.get("kind") or _detect_kind(path)
 
-    base_format, base_scale, base_width, base_height, base_gdt = (
+    params = _resolve_output_params(job, base_workflow)
+    params["kind"] = kind
+    params["path"] = path
+    params["upscale_images"] = base_workflow.get("UpscaleImages", True)
+    params["upscale_archives"] = base_workflow.get("UpscaleArchives", True)
+    return params
+
+
+def _resolve_output_params(
+    job: dict[str, Any], base_workflow: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve the output/options half of a job, shared by jobs and chapters."""
+    out = job.get("output") or {}
+    opts = job.get("options") or {}
+
+    base_format, base_scale, base_width, base_height, _base_gdt = (
         resolve_workflow_params(base_workflow)
     )
 
@@ -121,14 +139,19 @@ def resolve_job(job: dict[str, Any], base_workflow: dict[str, Any]) -> dict[str,
             target_height = int(opts["height"])
 
     return {
-        "kind": kind,
-        "path": path,
-        "output_folder": out.get("folder") or base_workflow.get("OutputFolderPath", "."),
-        "output_filename": out.get("filename", base_workflow.get("OutputFilename", "%filename%")),
-        "overwrite": out.get("overwrite", base_workflow.get("OverwriteExistingFiles", False)),
+        "output_folder": out.get("folder")
+        or base_workflow.get("OutputFolderPath", "."),
+        "output_filename": out.get(
+            "filename", base_workflow.get("OutputFilename", "%filename%")
+        ),
+        "overwrite": out.get(
+            "overwrite", base_workflow.get("OverwriteExistingFiles", False)
+        ),
         "image_format": out.get("format") or base_format,
         "quality": out.get("quality", base_workflow.get("LossyCompressionQuality", 80)),
-        "lossless": out.get("lossless", base_workflow.get("UseLosslessCompression", False)),
+        "lossless": out.get(
+            "lossless", base_workflow.get("UseLosslessCompression", False)
+        ),
         "target_scale": target_scale,
         "target_width": target_width,
         "target_height": target_height,
@@ -137,9 +160,20 @@ def resolve_job(job: dict[str, Any], base_workflow: dict[str, Any]) -> dict[str,
             "grayscale_detection_threshold",
             base_workflow.get("GrayscaleDetectionThreshold", 12),
         ),
-        "upscale_images": base_workflow.get("UpscaleImages", True),
-        "upscale_archives": base_workflow.get("UpscaleArchives", True),
     }
+
+
+def resolve_chapter_job(
+    job: dict[str, Any], base_workflow: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve an ``open_chapter`` request into engine parameters.
+
+    A chapter has no single input path: pages arrive later through ``page``
+    messages, so only the output/options and the expected page count are resolved.
+    """
+    params = _resolve_output_params(job, base_workflow)
+    params["total_pages"] = int(job.get("total_pages") or 0)
+    return params
 
 
 class _JobReporter(ProgressReporter):
@@ -175,7 +209,7 @@ class _JobReporter(ProgressReporter):
     def file_completed(self, kind: str) -> None:
         with self._lock:
             self._completed += 1
-            if kind == "postprocess_worker_zip_image":
+            if kind in ("postprocess_worker_zip_image", "postprocess_worker_page"):
                 self._archive_completed += 1
             elif kind == "postprocess_worker_zip_archive":
                 if self._archive_total is not None:
@@ -183,7 +217,11 @@ class _JobReporter(ProgressReporter):
             completed = self._completed
             archive_total = self._archive_total
             archive_completed = self._archive_completed
-        event: dict[str, Any] = {"type": "progress", "id": self._id, "completed": completed}
+        event: dict[str, Any] = {
+            "type": "progress",
+            "id": self._id,
+            "completed": completed,
+        }
         if archive_total is not None:
             event["archive_total"] = archive_total
             event["archive_completed"] = archive_completed
@@ -227,10 +265,17 @@ class Worker:
         self._current_id: str | None = None
         self._current_controller: ProgressController | None = None
         self._shutdown = False
+        # Active chapter streams keyed by job id. The reader thread routes
+        # ``page``/``close_chapter`` messages into these queues while the chapter
+        # job runs on the job loop.
+        self._chapter_inputs: dict[str, queue.Queue[Any]] = {}
+        self._chapter_indices: dict[str, dict[str, int]] = {}
 
         self.engine = UpscaleEngine(settings)
 
-        base = settings["Workflows"]["$values"][settings.get("SelectedWorkflowIndex", 0)]
+        base = settings["Workflows"]["$values"][
+            settings.get("SelectedWorkflowIndex", 0)
+        ]
         self.base_workflow = base
 
         if warmup:
@@ -256,7 +301,9 @@ class Worker:
     def _ready(self) -> None:
         with self._lock:
             capacity = self.queue_capacity - self._outstanding
-            self._write({"type": "ready", "capacity": capacity, "device": self.device_info})
+            self._write(
+                {"type": "ready", "capacity": capacity, "device": self.device_info}
+            )
 
     # -- accelerator cache release ------------------------------------------ #
 
@@ -320,14 +367,58 @@ class Worker:
         job_id = msg.get("id")
         with self._lock:
             if self._outstanding >= self.queue_capacity:
-                self._write(
-                    {"type": "rejected", "id": job_id, "reason": "queue_full"}
-                )
+                self._write({"type": "rejected", "id": job_id, "reason": "queue_full"})
                 return
             self._outstanding += 1
             capacity = self.queue_capacity - self._outstanding
         self._job_queue.put(msg)
         self.emit({"type": "accepted", "id": job_id, "capacity": capacity})
+
+    def _accept_chapter(self, msg: dict[str, Any]) -> None:
+        """Accept an ``open_chapter`` job and create its page input queue.
+
+        The queue must exist before the first ``page`` message arrives, so it is
+        registered here rather than when the job loop starts the chapter.
+        """
+        job_id = msg.get("id")
+        with self._lock:
+            if self._outstanding >= self.queue_capacity:
+                self._write({"type": "rejected", "id": job_id, "reason": "queue_full"})
+                return
+            self._outstanding += 1
+            capacity = self.queue_capacity - self._outstanding
+            self._chapter_inputs[job_id] = queue.Queue()
+            self._chapter_indices[job_id] = {}
+        self._job_queue.put(msg)
+        self.emit({"type": "accepted", "id": job_id, "capacity": capacity})
+
+    def _handle_page(self, msg: dict[str, Any]) -> None:
+        job_id = msg.get("id")
+        with self._lock:
+            page_queue = self._chapter_inputs.get(job_id)
+            if page_queue is not None:
+                self._chapter_indices[job_id][msg.get("name")] = msg.get("index")
+        if page_queue is None:
+            self.emit(
+                {
+                    "type": "error",
+                    "id": job_id,
+                    "message": "no active chapter for this page",
+                }
+            )
+            return
+        page_queue.put((msg.get("name"), msg.get("path")))
+
+    def _handle_close_chapter(self, msg: dict[str, Any]) -> None:
+        job_id = msg.get("id")
+        with self._lock:
+            page_queue = self._chapter_inputs.get(job_id)
+        if page_queue is None:
+            self.emit(
+                {"type": "error", "id": job_id, "message": "no active chapter to close"}
+            )
+            return
+        page_queue.put(PAGE_SENTINEL)
 
     def _cancel(self, job_id: str | None) -> None:
         if job_id is None:
@@ -335,7 +426,9 @@ class Worker:
             return
         with self._lock:
             self._cancelled.add(job_id)
-            controller = self._current_controller if self._current_id == job_id else None
+            controller = (
+                self._current_controller if self._current_id == job_id else None
+            )
         if controller is not None:
             controller.abort()
         self.emit({"type": "cancelled", "id": job_id})
@@ -401,6 +494,10 @@ class Worker:
         )
 
     def _run_job(self, job: dict[str, Any]) -> None:
+        if job.get("type") == "open_chapter":
+            self._run_chapter_job(job)
+            return
+
         job_id = job.get("id")
 
         try:
@@ -413,7 +510,9 @@ class Worker:
             cancelled = job_id in self._cancelled
         if cancelled:
             self._cancelled.discard(job_id)
-            self.emit({"type": "done", "id": job_id, "status": "cancelled", "files": []})
+            self.emit(
+                {"type": "done", "id": job_id, "status": "cancelled", "files": []}
+            )
             return
 
         controller = ProgressController()
@@ -445,6 +544,102 @@ class Worker:
                     self._current_id = None
                     self._current_controller = None
             self._cancelled.discard(job_id)
+
+    def _run_chapter_job(self, job: dict[str, Any]) -> None:
+        """Run a streaming chapter: pages arrive through the job's input queue.
+
+        Pages are emitted as ``page_done`` events as soon as each one is on disk
+        (so the driver can stream it back immediately); the final ``done`` event
+        carries the complete ``files`` list, exactly like a normal job.
+        """
+        job_id = job.get("id")
+
+        try:
+            params = resolve_chapter_job(job, self.base_workflow)
+        except Exception as e:
+            self._cleanup_chapter(job_id)
+            self.emit(
+                {"type": "error", "id": job_id, "message": f"invalid chapter: {e}"}
+            )
+            return
+
+        with self._lock:
+            cancelled = job_id in self._cancelled
+            page_queue = self._chapter_inputs.get(job_id)
+        if cancelled:
+            self._cancelled.discard(job_id)
+            self._cleanup_chapter(job_id)
+            self.emit(
+                {"type": "done", "id": job_id, "status": "cancelled", "files": []}
+            )
+            return
+        if page_queue is None:
+            self.emit(
+                {
+                    "type": "error",
+                    "id": job_id,
+                    "message": "chapter input queue missing",
+                }
+            )
+            return
+
+        controller = ProgressController()
+        reporter = _JobReporter(self.emit, job_id)
+
+        with self._lock:
+            self._current_id = job_id
+            self._current_controller = controller
+
+        self.emit({"type": "started", "id": job_id})
+        start = time.monotonic()
+
+        def on_page_done(result: dict[str, Any]) -> None:
+            with self._lock:
+                index = self._chapter_indices.get(job_id, {}).get(result.get("input"))
+            self.emit({"type": "page_done", "id": job_id, "index": index, **result})
+
+        try:
+            if params["total_pages"]:
+                reporter.archive_total(params["total_pages"])
+            result = self.engine.upscale_pages(
+                page_queue,
+                params["output_folder"],
+                params["image_format"],
+                params["quality"],
+                params["lossless"],
+                params["target_scale"],
+                params["target_width"],
+                params["target_height"],
+                params["chains"],
+                params["grayscale_threshold"],
+                reporter=reporter,
+                controller=controller,
+                on_page_done=on_page_done,
+            )
+            status = "cancelled" if controller.aborted else "ok"
+            self.emit(
+                {
+                    "type": "done",
+                    "id": job_id,
+                    "status": status,
+                    "files": result.files,
+                    "elapsed_seconds": round(time.monotonic() - start, 3),
+                }
+            )
+        except Exception as e:
+            self.emit({"type": "error", "id": job_id, "message": str(e)})
+        finally:
+            with self._lock:
+                if self._current_id == job_id:
+                    self._current_id = None
+                    self._current_controller = None
+            self._cancelled.discard(job_id)
+            self._cleanup_chapter(job_id)
+
+    def _cleanup_chapter(self, job_id: str | None) -> None:
+        with self._lock:
+            self._chapter_inputs.pop(job_id, None)
+            self._chapter_indices.pop(job_id, None)
 
     def _job_loop(self) -> None:
         poll = 0.5
@@ -483,15 +678,33 @@ class Worker:
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError as e:
-                self.emit({"type": "error", "id": None, "message": f"invalid JSON: {e}"})
+                self.emit(
+                    {"type": "error", "id": None, "message": f"invalid JSON: {e}"}
+                )
                 continue
             if not isinstance(msg, dict):
-                self.emit({"type": "error", "id": None, "message": "request must be an object"})
+                self.emit(
+                    {
+                        "type": "error",
+                        "id": None,
+                        "message": "request must be an object",
+                    }
+                )
                 continue
 
             mtype = msg.get("type")
             if mtype == "job":
                 self._accept(msg)
+            elif mtype == "open_chapter":
+                self._accept_chapter(msg)
+            elif mtype == "page":
+                self._handle_page(msg)
+            elif mtype == "close_chapter":
+                self._handle_close_chapter(msg)
+            elif mtype == "preload":
+                chains = msg.get("chains") or self.base_workflow["Chains"]["$values"]
+                loaded = self.engine.warmup(chains)
+                self.emit({"type": "preloaded", "loaded": loaded})
             elif mtype == "cancel":
                 self._cancel(msg.get("id"))
             elif mtype == "release_cache":
@@ -503,17 +716,20 @@ class Worker:
                 self.emit({"type": "pong"})
             else:
                 self.emit(
-                    {"type": "error", "id": msg.get("id"), "message": f"unknown request type: {mtype}"}
+                    {
+                        "type": "error",
+                        "id": msg.get("id"),
+                        "message": f"unknown request type: {mtype}",
+                    }
                 )
 
         self._shutdown = True
         self._job_queue.put(None)
 
     def run(self) -> None:
-        # The job loop runs on the *main* thread so that the postprocess
-        # subprocess (multiprocessing fork) is always started from the main
-        # thread, matching the original CLI/GUI behaviour and avoiding
-        # fork-from-a-worker-thread deadlocks.
+        # The job loop runs on the *main* thread; each job's preprocess, upscale
+        # and postprocess stages run on their own threads. The reader thread only
+        # dispatches requests, so a chapter can receive pages while it runs.
         self._ready()
         reader = threading.Thread(target=self._stdin_loop, daemon=True)
         reader.start()
@@ -560,7 +776,9 @@ def main() -> None:
         prog="python worker.py",
         description="Long-running, single-client upscale worker speaking NDJSON over stdin/stdout.",
     )
-    parser.add_argument("--settings", help="Path to an appstate2.json-style settings file.")
+    parser.add_argument(
+        "--settings", help="Path to an appstate2.json-style settings file."
+    )
     parser.add_argument(
         "-m",
         "--models-directory-path",
