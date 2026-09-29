@@ -1996,6 +1996,15 @@ class UpscaleEngine:
         chains: list[dict[str, Any]],
         grayscale_detection_threshold: int,
     ) -> None:
+        """Upscale a single image file through the three-stage pipeline.
+
+        This is the per-image building block behind :meth:`upscale_file` for
+        ``.png``/``.jpg``/... inputs: it decodes ``input_image_path``, runs the
+        matched chain and writes the encoded result to ``output_image_path``
+        (skipping when the output already exists and overwrite is disabled).
+        Results are collected on ``exec.result``. Use :meth:`upscale_image_bytes`
+        for an in-memory page and :meth:`upscale_pages` for a streamed chapter.
+        """
         upscale_queue: Queue = Queue(maxsize=1)
         postprocess_queue: Queue = Queue(maxsize=1)
         progress_queue: Queue = Queue()
