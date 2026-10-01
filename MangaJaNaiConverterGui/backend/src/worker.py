@@ -420,6 +420,21 @@ class Worker:
             return
         page_queue.put(PAGE_SENTINEL)
 
+    def _signal_active_chapters(self) -> None:
+        """Unblock any in-flight chapter stream when the reader stops.
+
+        On shutdown/EOF no further ``close_chapter`` can arrive, so without this the
+        job loop would block forever on the chapter's page queue. The host's kill
+        masks it, but a bare worker (or a crashed host) would leak the process.
+        """
+        with self._lock:
+            queues = list(self._chapter_inputs.values())
+            controller = self._current_controller
+        if controller is not None:
+            controller.abort()
+        for page_queue in queues:
+            page_queue.put(PAGE_SENTINEL)
+
     def _cancel(self, job_id: str | None) -> None:
         if job_id is None:
             self.emit({"type": "error", "id": None, "message": "cancel requires an id"})
@@ -724,6 +739,7 @@ class Worker:
                 )
 
         self._shutdown = True
+        self._signal_active_chapters()
         self._job_queue.put(None)
 
     def run(self) -> None:

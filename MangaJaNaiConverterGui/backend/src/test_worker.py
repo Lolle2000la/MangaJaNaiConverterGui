@@ -458,6 +458,48 @@ def test_worker_chapter_streams_pages(tmp_path):
     w.shutdown()
 
 
+def test_worker_shutdown_mid_chapter_emits_exited(tmp_path):
+    settings_path, out_dir = make_chapter_settings(tmp_path)
+
+    page = tmp_path / "page_000.png"
+    write_image(str(page))
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    w.send(
+        {
+            "type": "open_chapter",
+            "id": "ch1",
+            "output": {"folder": out_dir, "format": "png"},
+            "total_pages": 3,
+        }
+    )
+    assert w.read_until("accepted")["id"] == "ch1"
+
+    # Send one page but never close the chapter, then ask the worker to shut down. The
+    # reader thread stops, so no close_chapter can arrive; before the fix the job loop
+    # blocked on the chapter's page queue forever and no "exited" event was emitted.
+    w.send(
+        {
+            "type": "page",
+            "id": "ch1",
+            "index": 0,
+            "name": page.name,
+            "path": str(page),
+        }
+    )
+    w.send({"type": "shutdown"})
+
+    assert w.read_until("exited", timeout=30) is not None
+    w.proc.stdin.close()
+    try:
+        w.proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        w.proc.kill()
+        raise AssertionError("worker did not exit after shutdown mid-chapter") from None
+
+
 def test_worker_chapter_reports_bad_page_without_failing(tmp_path):
     settings_path, out_dir = make_chapter_settings(tmp_path)
     good = tmp_path / "good.png"
