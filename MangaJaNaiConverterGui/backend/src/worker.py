@@ -26,6 +26,7 @@ import gc
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -787,6 +788,44 @@ def _load_settings(args: argparse.Namespace) -> dict[str, Any]:
     return settings
 
 
+def _die_with_parent(parent_pid: int | None) -> None:
+    """Exit when the parent process dies.
+
+    A driver that is SIGKILLed would otherwise reparent this worker, which keeps the model (and its
+    GPU memory) resident indefinitely. On Linux, ``PR_SET_PDEATHSIG`` asks the kernel to SIGKILL us
+    when the parent dies, even if our stdin stays open because another process inherited the pipe.
+    Elsewhere, a daemon thread polls the parent pid. ``parent_pid`` guards against the process having
+    already been reparented before the check ran.
+    """
+    if parent_pid is None:
+        return
+
+    if os.getppid() != parent_pid:
+        os._exit(1)
+
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            pr_set_pdeathsig = 1
+            if libc.prctl(pr_set_pdeathsig, signal.SIGKILL) == 0:
+                # The parent may have died between the getppid check and the prctl call.
+                if os.getppid() != parent_pid:
+                    os._exit(1)
+                return
+        except Exception:  # noqa: BLE001 - fall back to polling
+            pass
+
+    def watch() -> None:
+        while True:
+            time.sleep(1.0)
+            if os.getppid() != parent_pid:
+                os._exit(1)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="python worker.py",
@@ -835,6 +874,15 @@ def main() -> None:
         help="Max number of in-flight + queued jobs. Default: 1",
     )
     parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help=(
+            "Exit when this parent process dies, so an abruptly killed driver does not "
+            "leave a warm model resident on the GPU."
+        ),
+    )
+    parser.add_argument(
         "--warmup",
         action="store_true",
         help="Preload all chain models before emitting the first 'ready' event.",
@@ -850,6 +898,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    _die_with_parent(args.parent_pid)
 
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)  # type: ignore
 
