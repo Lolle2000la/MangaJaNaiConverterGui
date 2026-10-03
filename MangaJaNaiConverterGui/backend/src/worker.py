@@ -26,7 +26,6 @@ import gc
 import json
 import os
 import queue
-import signal
 import sys
 import threading
 import time
@@ -792,30 +791,19 @@ def _die_with_parent(parent_pid: int | None) -> None:
     """Exit when the parent process dies.
 
     A driver that is SIGKILLed would otherwise reparent this worker, which keeps the model (and its
-    GPU memory) resident indefinitely. On Linux, ``PR_SET_PDEATHSIG`` asks the kernel to SIGKILL us
-    when the parent dies, even if our stdin stays open because another process inherited the pipe.
-    Elsewhere, a daemon thread polls the parent pid. ``parent_pid`` guards against the process having
-    already been reparented before the check ran.
+    GPU memory) resident indefinitely. ``parent_pid`` guards against the process having already been
+    reparented before the check ran.
+
+    A daemon thread polls the parent pid rather than arming ``PR_SET_PDEATHSIG``: the kernel delivers
+    that signal when the parent *thread* that forked us exits, and the driver starts us from a thread
+    pool thread, so a retired thread would SIGKILL a healthy worker. Polling follows the parent
+    process, which is what "the driver died" actually means, and costs one getppid per second.
     """
     if parent_pid is None:
         return
 
     if os.getppid() != parent_pid:
         os._exit(1)
-
-    if sys.platform.startswith("linux"):
-        try:
-            import ctypes
-
-            libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            pr_set_pdeathsig = 1
-            if libc.prctl(pr_set_pdeathsig, signal.SIGKILL) == 0:
-                # The parent may have died between the getppid check and the prctl call.
-                if os.getppid() != parent_pid:
-                    os._exit(1)
-                return
-        except Exception:  # noqa: BLE001 - fall back to polling
-            pass
 
     def watch() -> None:
         while True:
