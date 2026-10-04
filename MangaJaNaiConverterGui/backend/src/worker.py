@@ -26,6 +26,7 @@ import gc
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -744,10 +745,25 @@ class Worker:
         self._signal_active_chapters()
         self._job_queue.put(None)
 
+    def _install_signal_handlers(self) -> None:
+        def handler(signum, frame):
+            # An external SIGINT/SIGTERM must abort the active job, not just interrupt whichever
+            # thread is waiting on it: reuse the same graceful stop as the "shutdown" command.
+            self._shutdown = True
+            self._signal_active_chapters()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, AttributeError):
+                # Not the main thread, or the signal is unavailable on this platform.
+                pass
+
     def run(self) -> None:
         # The job loop runs on the *main* thread; each job's preprocess, upscale
         # and postprocess stages run on their own threads. The reader thread only
         # dispatches requests, so a chapter can receive pages while it runs.
+        self._install_signal_handlers()
         self._ready()
         reader = threading.Thread(target=self._stdin_loop, daemon=True)
         reader.start()

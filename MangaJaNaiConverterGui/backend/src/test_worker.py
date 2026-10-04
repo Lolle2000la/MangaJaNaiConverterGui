@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -456,6 +457,105 @@ def test_worker_chapter_streams_pages(tmp_path):
         assert (tmp_path / "chapter_out" / page.name).is_file()
 
     w.shutdown()
+
+
+class _SignalController:
+    """Minimal ProgressController stand-in for the signal-handler unit test."""
+
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class _SignalWorker:
+    """Exercises the real signal handling without constructing a full Worker.
+
+    ``_install_signal_handlers`` only touches ``_shutdown`` and
+    ``_signal_active_chapters``, so the real bound methods run against these few
+    attributes instead of paying for model/engine construction.
+    """
+
+    _install_signal_handlers = worker_mod.Worker._install_signal_handlers
+    _signal_active_chapters = worker_mod.Worker._signal_active_chapters
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._chapter_inputs = {"ch": queue.Queue()}
+        self._current_controller = _SignalController()
+
+
+def test_install_signal_handlers_abort_on_sigint():
+    """The registered SIGINT handler sets the shutdown flag and aborts the job.
+
+    A real signal cannot be delivered deterministically from inside the test
+    process, so this verifies the wiring directly: the handler is installed for
+    SIGINT/SIGTERM and, when invoked, performs the same graceful stop as the
+    ``shutdown`` command.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        if pytest is not None:
+            pytest.skip("signal handlers can only be installed on the main thread")
+        return
+
+    stub = _SignalWorker()
+    saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        stub._install_signal_handlers()
+        handler = signal.getsignal(signal.SIGINT)
+        assert handler is not saved[signal.SIGINT]
+        assert handler is signal.getsignal(signal.SIGTERM)
+
+        handler(signal.SIGINT, None)
+    finally:
+        for sig, old in saved.items():
+            signal.signal(sig, old)
+
+    assert stub._shutdown is True
+    assert stub._current_controller.aborted is True
+    # Every in-flight chapter stream is unblocked so the job loop cannot hang.
+    assert stub._chapter_inputs["ch"].get_nowait() is worker_mod.PAGE_SENTINEL
+
+
+def test_worker_sigint_during_job_exits_gracefully(tmp_path):
+    """An external SIGINT (Ctrl+C) aborts the active job and exits the worker.
+
+    This is the end-to-end counterpart to the wiring test: the signal is
+    delivered to a real worker mid-job and must not leave the non-daemon
+    pipeline stages upscaling pages after the interrupt.
+    """
+    settings_path, _out_dir = make_chapter_settings(tmp_path)
+
+    slow = tmp_path / "slow"
+    slow.mkdir()
+    for i in range(400):
+        write_image(str(slow / f"i{i:03d}.png"))
+
+    w = WorkerClient(settings_path, capacity="1")
+    assert w.read()["type"] == "ready"
+
+    w.send(
+        {
+            "type": "job",
+            "id": "s1",
+            "input": {"path": str(slow), "kind": "folder"},
+            "output": {"folder": str(tmp_path / "os"), "format": "png"},
+        }
+    )
+    assert w.read_until("accepted")["id"] == "s1"
+    started = w.read_until("started")
+    assert started is not None and started["id"] == "s1"
+
+    w.proc.send_signal(signal.SIGINT)
+
+    assert w.read_until("exited", timeout=30) is not None
+    try:
+        w.proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        w.proc.kill()
+        raise AssertionError("worker did not exit after SIGINT") from None
 
 
 def test_worker_shutdown_mid_chapter_emits_exited(tmp_path):

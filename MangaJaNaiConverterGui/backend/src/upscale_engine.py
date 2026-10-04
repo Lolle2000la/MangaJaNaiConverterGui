@@ -1932,6 +1932,7 @@ class UpscaleEngine:
 
         preprocess_process = Thread(
             target=self._preprocess_worker_archive,
+            daemon=True,
             args=(
                 exec,
                 upscale_queue,
@@ -1947,13 +1948,16 @@ class UpscaleEngine:
         preprocess_process.start()
 
         upscale_process = Thread(
-            target=self._upscale_worker, args=(exec, upscale_queue, postprocess_queue)
+            target=self._upscale_worker,
+            args=(exec, upscale_queue, postprocess_queue),
+            daemon=True,
         )
         upscale_process.start()
 
         postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
             target=_run_postprocess,
+            daemon=True,
             args=(
                 exec.controller,
                 _postprocess_worker_zip,
@@ -2028,6 +2032,7 @@ class UpscaleEngine:
 
         preprocess_process = Thread(
             target=self._preprocess_worker_image,
+            daemon=True,
             args=(
                 exec,
                 upscale_queue,
@@ -2044,13 +2049,16 @@ class UpscaleEngine:
         preprocess_process.start()
 
         upscale_process = Thread(
-            target=self._upscale_worker, args=(exec, upscale_queue, postprocess_queue)
+            target=self._upscale_worker,
+            args=(exec, upscale_queue, postprocess_queue),
+            daemon=True,
         )
         upscale_process.start()
 
         postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
             target=_run_postprocess,
+            daemon=True,
             args=(
                 exec.controller,
                 _postprocess_worker_image,
@@ -2128,6 +2136,7 @@ class UpscaleEngine:
 
         preprocess_thread = Thread(
             target=self._preprocess_worker_pages,
+            daemon=True,
             args=(
                 exec,
                 upscale_queue,
@@ -2143,13 +2152,16 @@ class UpscaleEngine:
         preprocess_thread.start()
 
         upscale_thread = Thread(
-            target=self._upscale_worker, args=(exec, upscale_queue, postprocess_queue)
+            target=self._upscale_worker,
+            args=(exec, upscale_queue, postprocess_queue),
+            daemon=True,
         )
         upscale_thread.start()
 
         postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
             target=_run_postprocess,
+            daemon=True,
             args=(
                 exec.controller,
                 _postprocess_worker_pages,
@@ -2375,6 +2387,7 @@ class UpscaleEngine:
 
         preprocess_process = Thread(
             target=self._preprocess_worker_folder,
+            daemon=True,
             args=(
                 exec,
                 upscale_queue,
@@ -2397,13 +2410,16 @@ class UpscaleEngine:
         preprocess_process.start()
 
         upscale_process = Thread(
-            target=self._upscale_worker, args=(exec, upscale_queue, postprocess_queue)
+            target=self._upscale_worker,
+            args=(exec, upscale_queue, postprocess_queue),
+            daemon=True,
         )
         upscale_process.start()
 
         postprocess_error: list[BaseException] = []
         postprocess_thread = Thread(
             target=_run_postprocess,
+            daemon=True,
             args=(
                 exec.controller,
                 _postprocess_worker_folder,
