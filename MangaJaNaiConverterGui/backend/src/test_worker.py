@@ -608,3 +608,70 @@ def test_engine_upscale_image_bytes(tmp_path):
     with Image.open(BytesIO(encoded)) as result:
         # A 2x scale with no model still resizes the output to 48x48.
         assert result.size == (48, 48)
+
+
+# --------------------------------------------------------------------------- #
+# SelectedDeviceIndex is CPU-inclusive (0 = CPU, 1 = first accelerator) but the
+# PyTorchSettings / accelerator list indexes over non-CPU devices only.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeDevice:
+    def __init__(self, device_type, torch_device: str) -> None:
+        self.type = device_type
+        self.torch_device = torch_device
+
+
+class _FakeDetector:
+    def __init__(self, devices: list) -> None:
+        self.available_devices = devices
+
+    def get_best_device(self, prefer_gpu: bool = False):
+        return self.available_devices[-1]
+
+
+def test_engine_maps_cpu_inclusive_device_index(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    settings = make_settings(str(tmp_path / "out"), str(models_dir))
+
+    # 1 = first accelerator -> 0-based index 0 over gpu_devices.
+    settings["SelectedDeviceIndex"] = 1
+    engine = worker_mod.UpscaleEngine(settings)
+    assert engine.settings_parser.get_bool("use_cpu", False) is False
+    assert engine.settings_parser.get_int("accelerator_device_index", 0) == 0
+
+    # A JSON string must be coerced, not treated as index 0.
+    settings["SelectedDeviceIndex"] = "2"
+    engine = worker_mod.UpscaleEngine(settings)
+    assert engine.settings_parser.get_int("accelerator_device_index", 0) == 1
+
+    # 0 = CPU.
+    settings["SelectedDeviceIndex"] = 0
+    engine = worker_mod.UpscaleEngine(settings)
+    assert engine.settings_parser.get_bool("use_cpu", False) is True
+
+
+def test_accelerator_torch_device_maps_cpu_inclusive_index(monkeypatch):
+    cpu = _FakeDevice(worker_mod.AcceleratorType.CPU, "cpu")
+    gpu0 = _FakeDevice(worker_mod.AcceleratorType.CUDA, "cuda:0")
+    gpu1 = _FakeDevice(worker_mod.AcceleratorType.CUDA, "cuda:1")
+    detector = _FakeDetector([cpu, gpu0, gpu1])
+    monkeypatch.setattr(worker_mod, "get_accelerator_detector", lambda: detector)
+
+    class _Stub:
+        pass
+
+    stub = _Stub()
+
+    # 0 = CPU mode: no accelerator cache to release.
+    stub.settings = {"SelectedDeviceIndex": 0}
+    assert worker_mod.Worker._accelerator_torch_device(stub) is None
+
+    # 1 = first non-CPU device, not the second.
+    stub.settings = {"SelectedDeviceIndex": 1}
+    assert worker_mod.Worker._accelerator_torch_device(stub) == "cuda:0"
+
+    # 2 = second non-CPU device.
+    stub.settings = {"SelectedDeviceIndex": 2}
+    assert worker_mod.Worker._accelerator_torch_device(stub) == "cuda:1"

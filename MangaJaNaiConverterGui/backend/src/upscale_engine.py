@@ -943,11 +943,21 @@ class UpscaleEngine:
     ) -> None:
         spandrel_custom.install(ignore_duplicates=True)
 
+        # ``SelectedDeviceIndex`` is CPU-inclusive (0 = CPU, 1 = first
+        # accelerator), while ``PyTorchSettings.accelerator_device_index`` is a
+        # 0-based index into the CPU-excluded ``gpu_devices`` list, so shift by
+        # one. The value may be a JSON string, so coerce it safely first.
+        raw_device_index = settings["SelectedDeviceIndex"]
+        try:
+            selected_device_index = int(raw_device_index)
+        except (TypeError, ValueError):
+            selected_device_index = 0
+
         self.settings_parser = SettingsParser(
             {
                 "use_cpu": settings["SelectedDeviceIndex"] == 0,
                 "use_fp16": settings["UseFp16"],
-                "accelerator_device_index": settings["SelectedDeviceIndex"],
+                "accelerator_device_index": max(selected_device_index - 1, 0),
                 "budget_limit": 0,
             }
         )

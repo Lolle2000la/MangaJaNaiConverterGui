@@ -324,8 +324,10 @@ class Worker:
             for device in get_accelerator_detector().available_devices
             if device.type != AcceleratorType.CPU
         ]
-        if gpu_devices and 0 <= index < len(gpu_devices):
-            return gpu_devices[index].torch_device
+        # ``SelectedDeviceIndex`` is CPU-inclusive (0 = CPU, 1 = first
+        # accelerator), but ``gpu_devices`` excludes the CPU, so shift by one.
+        if gpu_devices and 1 <= index <= len(gpu_devices):
+            return gpu_devices[index - 1].torch_device
 
         best = get_accelerator_detector().get_best_device(prefer_gpu=True)
         if best is not None and best.type != AcceleratorType.CPU:
